@@ -13,6 +13,8 @@ import datetime as dt
 from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import minimize_scalar
+import os
+from datetime import datetime
 
 try:
     import plotly.graph_objects as go
@@ -2156,16 +2158,24 @@ class AITradingBot:
         self.visualizer = EnhancedPerformanceVisualizer()
         
     def run_analysis(self, 
-                symbol: str = 'TATAMOTORS',
-                period: str = '3y',
-                initial_capital: float = 100000,
-                show_plots: bool = True,
-                save_html: bool = True) -> Dict[str, Any]:
-        """Run complete trading analysis with enhanced visualizations"""
+            symbol: str = 'TATAMOTORS',
+            period: str = '3y',
+            initial_capital: float = 100000,
+            show_plots: bool = True,
+            save_html: bool = True) -> Dict[str, Any]:
+        """Run complete trading analysis with timestamped folder organization"""
         
         logger.info(f"Starting analysis for {symbol}")
         
+        # STEP 1: Create timestamped folder
+        from datetime import datetime
+        import os
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        reports_folder = f"reports/{symbol}_{timestamp}"
+        os.makedirs(reports_folder, exist_ok=True)
+        
         try:
+            # Your existing data processing code (unchanged)
             price_data = self.data_manager.download_data(symbol, period)
             market_data = self.data_manager.download_market_index(period)
             feature_data = self.feature_builder.build_features(price_data, market_data=market_data)
@@ -2175,32 +2185,31 @@ class AITradingBot:
             results = backtester.run_backtest(self.model, self.threshold_optimizer, initial_capital)
             
             if show_plots and PLOTLY_AVAILABLE:
-                import webbrowser
-                import os
-                
                 logger.info("Creating comprehensive visualizations...")
                 figures = self.visualizer.create_comprehensive_dashboard(
                     results, symbol, market_data
                 )
                 
-               
-                for name, fig in figures.items():
-                    if fig:
-                        if save_html:
-                            filename = f"{symbol}_{name}_dashboard.html"
-                            fig.write_html(filename)
-                            logger.info(f"Saved: {filename}")
-                            
-                            # Open in browser
-                            # file_path = os.path.abspath(filename)
-                            # webbrowser.open(f'file://{file_path}')
-                            # logger.info(f" Opened: {filename}")
-                        else:
-                           
-                            fig.show()
-               
+                # STEP 2: Save all HTML files to timestamped folder
                 if save_html:
-                    self._create_dashboard_index(symbol)
+                    for name, fig in figures.items():
+                        if fig:
+                            filepath = os.path.join(reports_folder, f"{name}_dashboard.html")
+                            fig.write_html(filepath)
+                            logger.info(f"Saved: {filepath}")
+                    
+                    # STEP 3: Save pickle file to same folder
+                    import pickle
+                    pickle_path = os.path.join(reports_folder, 'results.pkl')
+                    with open(pickle_path, 'wb') as f:
+                        pickle.dump(results, f)
+                    logger.info(f"Saved results: {pickle_path}")
+                    
+                    # STEP 4: Create master index and open browser
+                    self._create_master_index(symbol, reports_folder)
+                    
+                    # STEP 5: Optional cleanup of old reports
+                    self._cleanup_old_reports(symbol, keep_last=5)
                 
                 results['figures'] = figures
                 
@@ -2215,7 +2224,6 @@ class AITradingBot:
             raise
 
 
-    
     def _print_analysis_report(self, symbol: str, results: Dict[str, Any]):
         """Enhanced analysis report with signal quality focus"""
         
@@ -2226,7 +2234,6 @@ class AITradingBot:
         print(f" ENHANCED AI TRADING BOT ANALYSIS - {symbol}")
         print("=" * 90)
         
-        # SIGNAL QUALITY ASSESSMENT
         auc = model_metrics.get('auc', 0)
         accuracy = model_metrics.get('accuracy', 0)
         
@@ -2242,7 +2249,7 @@ class AITradingBot:
             print(f"   SIGNAL STRENGTH: WEAK - Poor predictive signals")
             print(f"   RECOMMENDATION: Need better feature engineering")
         
-        # Enhanced performance metrics
+        
         sharpe = stats.get('sharpe_ratio', 0)
         num_trades = stats.get('num_trades', 0)
         win_rate = stats.get('win_rate', 0)
@@ -2254,7 +2261,7 @@ class AITradingBot:
         print(f"  Number of Trades: {num_trades}")
         print(f"  Max Drawdown:     {stats.get('max_drawdown', 0):.2%}")
         
-        # Overall assessment
+        
         print(f"\n OVERALL ASSESSMENT:")
         if auc > 0.55 and sharpe > 1.0:
             print(f" EXCELLENT: Strong signals + great returns")
@@ -2349,10 +2356,119 @@ class AITradingBot:
         with open(index_filename, 'w', encoding='utf-8') as f:  # FIXED: Added encoding='utf-8'
             f.write(html_content)
         
-        # Open the index page
+        
         index_path = os.path.abspath(index_filename)
         webbrowser.open(f'file://{index_path}')
         logger.info(f"Dashboard index opened: {index_filename}")
+
+    def _create_master_index(self, symbol: str, latest_folder: str):
+        """Create a master index HTML pointing to latest reports"""
+        import webbrowser
+        
+        html_files = [f for f in os.listdir(latest_folder) if f.endswith('.html')]
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{symbol} AI Trading Bot - Latest Reports</title>
+            <style>
+                body {{ 
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                    margin: 40px; 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    min-height: 100vh;
+                }}
+                .container {{
+                    background: rgba(255,255,255,0.1);
+                    padding: 30px;
+                    border-radius: 15px;
+                    backdrop-filter: blur(10px);
+                    max-width: 800px;
+                    margin: 0 auto;
+                }}
+                h1 {{ color: #fff; text-align: center; margin-bottom: 30px; }}
+                h2 {{ color: #f0f0f0; }}
+                .report-link {{ 
+                    display: block; 
+                    padding: 15px; 
+                    margin: 10px 0; 
+                    background: rgba(255,255,255,0.2); 
+                    text-decoration: none; 
+                    border-radius: 8px;
+                    color: white;
+                    font-weight: bold;
+                    transition: all 0.3s ease;
+                }}
+                .report-link:hover {{ 
+                    background: rgba(255,255,255,0.3); 
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+                }}
+                .timestamp {{ 
+                    opacity: 0.8; 
+                    font-size: 14px; 
+                    text-align: center; 
+                    margin-top: 20px; 
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1> AI POWERED TRADING BOT </h1>
+                <h2> Analysis of {symbol}</h2>
+                
+                <div class="reports">
+        """
+        
+        
+        for html_file in sorted(html_files):
+            report_name = html_file.replace('_dashboard.html', '').replace('_', ' ').title()
+            relative_path = f"{os.path.basename(latest_folder)}/{html_file}"
+            html_content += f'<a href="{relative_path}" class="report-link"> {report_name}</a>\n'
+        
+        html_content += f"""
+                </div>
+                
+                <div class="timestamp">
+                    Generated by Aaditya V: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        
+        index_filename = f"reports/{symbol}_latest_index.html"
+        with open(index_filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        
+        index_path = os.path.abspath(index_filename)
+        webbrowser.open(f'file://{index_path}')
+        logger.info(f"Dashboard index opened: {index_filename}")
+
+    def _cleanup_old_reports(self, symbol: str, keep_last: int = 5):
+        """Remove old report folders, keeping only the most recent ones"""
+        import glob
+        import shutil
+        
+        
+        pattern = f"reports/{symbol}_*"
+        folders = sorted(glob.glob(pattern), reverse=True)  
+        
+    
+        old_folders = folders[keep_last:]
+        for folder in old_folders:
+            try:
+                shutil.rmtree(folder)
+                logger.info(f"Cleaned up old reports: {folder}")
+            except Exception as e:
+                logger.warning(f"Could not delete {folder}: {e}")
+        
+        if old_folders:
+            logger.info(f"Kept {min(len(folders), keep_last)} most recent report folders")
 
 # =========================
 # Main execution
@@ -2360,7 +2476,6 @@ class AITradingBot:
 def main():
     """Enhanced main execution"""
     
-    # Use improved configuration
     config = TradingConfig(
         target_annual_vol=0.18,
         max_drawdown=0.12,
@@ -2374,7 +2489,7 @@ def main():
     bot = AITradingBot(config)
     
    
-    symbol = 'RELIANCE'
+    symbol = 'HINDUNILVR'
     
     try:
         logger.info(f"Running enhanced analysis for {symbol}...")
@@ -2386,9 +2501,9 @@ def main():
         )
         
         # Optional: Save results and plots
-        import pickle
-        with open(f'{symbol}_enhanced_results.pkl', 'wb') as f:
-            pickle.dump(results, f)
+        # import pickle
+        # with open(f'{symbol}_enhanced_results.pkl', 'wb') as f:
+         #   pickle.dump(results, f)
             
     except Exception as e:
         logger.error(f"Analysis failed: {e}")

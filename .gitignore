@@ -1,0 +1,8 @@
+# Ignore generated dashboards and pickle files
+*.html
+*.pkl
+
+# Trading bot reports
+reports/
+*.pkl
+_pycache_/
