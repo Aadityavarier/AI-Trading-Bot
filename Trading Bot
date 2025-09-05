@@ -1,0 +1,1876 @@
+from __future__ import annotations
+import sys
+import math
+import logging
+import warnings
+from typing import Dict, Optional, Tuple, Any, List, Union
+import json
+import numpy as np
+import pandas as pd
+import numba as nb
+from pathlib import Path
+import datetime as dt
+from dataclasses import dataclass
+from scipy import stats
+from scipy.optimize import minimize_scalar
+
+# ML
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif, mutual_info_classif
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+
+# External models 
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LGB_AVAILABLE = True
+except ImportError:
+    LGB_AVAILABLE = False
+
+# Data
+try:
+    import yfinance as yf
+    YF_AVAILABLE = True
+except ImportError:
+    YF_AVAILABLE = False
+
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("Ai_AI_Trading_Bot")
+
+# =========================
+# Configuration
+# =========================
+@dataclass
+class TradingConfig:
+    # Risk parameters
+    target_annual_vol: float = 0.12
+    max_drawdown: float = 0.08
+    max_position_pct: float = 0.15
+    min_confidence: float = 0.55
+    
+    # Stop loss / Take profit
+    stop_atr_multiplier: float = 1.5
+    tp_atr_multiplier: float = 3.0
+    trailing_atr_multiplier: float = 1.2
+    max_hold_days: int = 10
+    
+    # Position sizing
+    kelly_fraction: float = 0.25  # Conservative Kelly
+    vol_lookback: int = 60
+    
+    # Cost parameters (India)
+    brokerage_bps: float = 5.0
+    stt_bps: float = 10.0
+    impact_coefficient: float = 0.1
+
+# =========================
+# Fast utilities (Numba optimized)
+# =========================
+@nb.njit(cache=True)
+def fast_rolling_mean(a: np.ndarray, w: int) -> np.ndarray:
+    out = np.empty_like(a)
+    out[:] = np.nan
+    csum = 0.0
+    for i in range(a.size):
+        csum += a[i]
+        if i >= w:
+            csum -= a[i - w]
+        if i >= w - 1:
+            out[i] = csum / w
+    return out
+
+@nb.njit(cache=True)
+def fast_rolling_std(a: np.ndarray, w: int) -> np.ndarray:
+    out = np.empty_like(a)
+    out[:] = np.nan
+    for i in range(a.size):
+        if i >= w - 1:
+            window = a[i - w + 1:i + 1]
+            m = 0.0
+            for v in window:
+                m += v
+            m /= w
+            s = 0.0
+            for v in window:
+                d = v - m
+                s += d * d
+            out[i] = math.sqrt(s / w)
+    return out
+
+@nb.njit(cache=True)
+def fast_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
+    rsi = np.empty_like(prices)
+    rsi[:] = np.nan
+    deltas = np.diff(prices)
+    if deltas.size < period + 1:
+        return rsi
+    
+    seed = deltas[:period]
+    up = 0.0
+    down = 0.0
+    for d in seed:
+        if d > 0:
+            up += d
+        else:
+            down -= d
+    up /= period
+    down /= period if down != 0 else 1.0
+    rs = up / down if down != 0 else 0.0
+    rsi[period] = 100. - 100. / (1. + rs)
+    
+    for i in range(period + 1, prices.size):
+        delta = deltas[i - 1]
+        upval = delta if delta > 0 else 0.0
+        downval = -delta if delta < 0 else 0.0
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period if down != 0 else 1.0
+        rs = up / down if down != 0 else 0.0
+        rsi[i] = 100. - 100. / (1. + rs)
+    return rsi
+
+@nb.njit(cache=True)
+def fast_bb_position(prices: np.ndarray, period: int = 20, std_mult: float = 2.0) -> np.ndarray:
+    sma = fast_rolling_mean(prices, period)
+    std = fast_rolling_std(prices, period)
+    bb_pos = np.empty_like(prices)
+    bb_pos[:] = np.nan
+    
+    for i in range(len(prices)):
+        if not np.isnan(sma[i]) and not np.isnan(std[i]) and std[i] > 0:
+            bb_pos[i] = (prices[i] - sma[i]) / (std_mult * std[i])
+        else:
+            bb_pos[i] = 0.0
+    return bb_pos
+
+# =========================
+# Performance metrics
+# =========================
+def cagr(returns: pd.Series) -> float:
+    """Compound Annual Growth Rate"""
+    if len(returns) < 2:
+        return 0.0
+    cumulative = (1 + returns).cumprod()
+    years = len(returns) / 252.0  # Trading days
+    if years <= 0:
+        return 0.0
+    end_val = cumulative.iloc[-1]
+    return (end_val ** (1 / years)) - 1 if end_val > 0 else -1.0
+
+def sharpe_ratio(returns: pd.Series, rf: float = 0.06) -> float:
+    """Sharpe ratio with risk-free rate"""
+    if returns.std() == 0 or len(returns) == 0:
+        return 0.0
+    excess = returns - rf / 252
+    return excess.mean() / returns.std() * np.sqrt(252)
+
+def sortino_ratio(returns: pd.Series, rf: float = 0.06) -> float:
+    """Sortino ratio focusing on downside deviation"""
+    excess = returns - rf / 252
+    downside = excess[excess < 0]
+    if len(downside) == 0 or downside.std() == 0:
+        return 0.0
+    return excess.mean() / downside.std() * np.sqrt(252)
+
+def max_drawdown(cum_returns: pd.Series) -> float:
+    """Maximum drawdown from peak"""
+    peak = cum_returns.cummax()
+    dd = (cum_returns - peak) / peak
+    return dd.min()
+
+def calmar_ratio(returns: pd.Series) -> float:
+    """Calmar ratio = CAGR / |Max Drawdown|"""
+    cum = (1 + returns).cumprod()
+    md = abs(max_drawdown(cum))
+    cg = cagr(returns)
+    return cg / md if md > 0 else 0.0
+
+def omega_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
+    """Omega ratio - probability weighted ratio of gains vs losses"""
+    excess = returns - threshold / 252
+    gains = excess[excess > 0].sum()
+    losses = -excess[excess < 0].sum()
+    return gains / losses if losses > 0 else float('inf')
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series, default_val: float = 1.0) -> pd.Series:
+        """Safely divide two series, handling zeros and infinities"""
+        # Replace zero denominators with a small epsilon
+        denominator = denominator.replace(0, 1e-8)
+        
+        # Perform division
+        result = numerator / denominator
+        
+        # Replace infinities and extreme values
+        result = result.replace([np.inf, -np.inf], default_val)
+        
+        # Cap extreme values
+        result = result.clip(-1000, 1000)  # Reasonable bounds
+        
+        return result.fillna(default_val)
+    
+# =========================
+# Enhanced regime detection
+# =========================
+class AdvancedRegimeDetector:
+    """Multi-dimensional regime detection using volatility, trend, and momentum"""
+    
+    def __init__(self):
+        self.vol_periods = [10, 20, 60]
+        self.trend_periods = [5, 20, 50]
+        self.mom_periods = [5, 10, 20]
+    
+    def detect_volatility_regime(self, returns: pd.Series) -> pd.Series:
+        """Detect high/low volatility regimes"""
+        vol_short = returns.rolling(10).std()
+        vol_long = returns.rolling(60).std()
+        vol_ratio = vol_short / vol_long
+        
+        # Regime classification: 0=normal, 1=high vol, -1=low vol
+        regime = pd.Series(0, index=returns.index)
+        regime[vol_ratio > 1.5] = 1  # High volatility
+        regime[vol_ratio < 0.7] = -1  # Low volatility
+        
+        return regime.fillna(0)
+    
+    def detect_trend_regime(self, prices: pd.Series) -> pd.Series:
+        """Detect trend regimes using multiple SMAs"""
+        sma5 = prices.rolling(5).mean()
+        sma20 = prices.rolling(20).mean()
+        sma50 = prices.rolling(50).mean()
+        
+        # Trend strength
+        trend_strength = (sma5 - sma50) / sma50
+        
+        # Regime classification
+        regime = pd.Series(0, index=prices.index)
+        regime[trend_strength > 0.02] = 1   # Uptrend
+        regime[trend_strength < -0.02] = -1  # Downtrend
+        
+        return regime.fillna(0)
+    
+    def detect_momentum_regime(self, prices: pd.Series) -> pd.Series:
+        """Detect momentum regimes"""
+        mom5 = prices.pct_change(5)
+        mom20 = prices.pct_change(20)
+        
+        # Momentum score
+        mom_score = (mom5 + mom20 * 0.5) / 1.5
+        mom_vol = mom_score.rolling(20).std()
+        
+        regime = pd.Series(0, index=prices.index)
+        regime[mom_score > mom_vol] = 1    # Strong momentum
+        regime[mom_score < -mom_vol] = -1   # Negative momentum
+        
+        return regime.fillna(0)
+    
+    def detect_market_stress(self, df: pd.DataFrame) -> pd.Series:
+        """Detect market stress using price gaps and volume"""
+        close = df['close']
+        open_price = df['open']
+        volume = df['volume']
+        
+        # Price gaps
+        gaps = ((open_price - close.shift(1)) / close.shift(1)).abs()
+        
+        # Volume spikes
+        vol_ma = volume.rolling(20).mean()
+        vol_spike = volume / vol_ma
+        
+        # Stress indicator
+        stress = (gaps > 0.03) | (vol_spike > 2.0)
+        return stress.astype(int)
+    
+    def detect(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Main regime detection method"""
+        close = df['close']
+        returns = close.pct_change().fillna(0)
+        
+        regimes = pd.DataFrame({
+            'vol_regime': self.detect_volatility_regime(returns),
+            'trend_regime': self.detect_trend_regime(close),
+            'mom_regime': self.detect_momentum_regime(close),
+            'stress_regime': self.detect_market_stress(df)
+        }, index=df.index)
+        
+        # Overall regime score
+        regimes['regime_score'] = (
+            regimes['trend_regime'] * 0.4 +
+            regimes['mom_regime'] * 0.3 +
+            regimes['vol_regime'] * 0.2 -
+            regimes['stress_regime'] * 0.1
+        )
+        
+        return regimes.fillna(0)
+    
+    def allow_trade(self, regime_row: pd.Series) -> bool:
+        """Determine if trading is allowed based on regime"""
+        # Block trades during high stress
+        if regime_row.get('stress_regime', 0) == 1:
+            return False
+        
+        # Block in extreme negative regimes
+        if regime_row.get('regime_score', 0) < -1.5:
+            return False
+            
+        # Block in extreme high volatility with negative trend
+        if (regime_row.get('vol_regime', 0) == 1 and 
+            regime_row.get('trend_regime', 0) == -1):
+            return False
+            
+        return True
+
+# =========================
+# Feature engineering
+# =========================
+class FeatureBuilder:
+    """Advanced feature engineering with multi-timeframe analysis"""
+    
+    def __init__(self):
+        self.regime_detector = AdvancedRegimeDetector()
+    
+    def technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """ENHANCED technical indicators with better signals"""
+        close = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        volume = df['volume'].astype(float)
+        
+        features = pd.DataFrame(index=df.index)
+        
+        # ENHANCED PRICE MOMENTUM FEATURES
+        for period in [3, 5, 8, 13, 21]:  # Fibonacci periods
+            momentum = close.pct_change(period)
+            features[f'momentum_{period}d'] = momentum
+            
+            # Momentum consistency (trending vs choppy)
+            mom_std = momentum.rolling(10).std()
+            features[f'momentum_consistency_{period}d'] = abs(momentum) / (mom_std + 1e-8)
+        
+        # VOLATILITY REGIME FEATURES
+        returns = close.pct_change().fillna(0)
+        for period in [5, 10, 20]:
+            vol = returns.rolling(period).std()
+            features[f'volatility_{period}d'] = vol
+            
+            # Volatility percentile (adaptive)
+            features[f'vol_percentile_{period}d'] = vol.rolling(60).rank(pct=True)
+        
+        # PRICE POSITION FEATURES
+        for period in [10, 20, 50]:
+            high_period = high.rolling(period).max()
+            low_period = low.rolling(period).min()
+            
+            # % position within recent range
+            range_size = high_period - low_period + 1e-8
+            features[f'price_position_{period}d'] = (close - low_period) / range_size
+            
+            # Distance from highs/lows
+            features[f'distance_from_high_{period}d'] = (high_period - close) / close
+            features[f'distance_from_low_{period}d'] = (close - low_period) / close
+        
+        # ENHANCED RSI WITH MULTIPLE PERIODS
+        for period in [7, 14, 21]:
+            rsi = pd.Series(fast_rsi(close.values, period), index=close.index)
+            features[f'rsi_{period}'] = rsi
+            
+            # RSI momentum (rate of change)
+            features[f'rsi_momentum_{period}'] = rsi.pct_change(5)
+            
+            # RSI divergence proxy
+            price_momentum = close.pct_change(period)
+            rsi_momentum = rsi.pct_change(period)
+            features[f'rsi_divergence_{period}'] = np.sign(price_momentum) != np.sign(rsi_momentum)
+        
+        # VOLUME-PRICE ANALYSIS
+        vwap = (volume * close).rolling(20).sum() / volume.rolling(20).sum()
+        features['vwap_deviation'] = (close - vwap) / vwap
+        
+        # Volume rate of change
+        volume_roc = volume.pct_change(5)
+        features['volume_momentum'] = volume_roc
+        
+        # Price-volume relationship
+        price_roc = close.pct_change(5)
+        features['price_volume_correlation'] = price_roc.rolling(20).corr(volume_roc)
+        
+        return features.fillna(0)
+
+
+class SignalValidator:
+    """Test individual features for predictive power before using them"""
+    
+    def __init__(self):
+        self.feature_scores = {}
+        self.validated_features = []
+    
+    def test_feature_predictive_power(self, feature_series: pd.Series, targets: pd.Series, 
+                                    feature_name: str, min_ic: float = 0.02) -> bool:
+        """Test if a feature has predictive power using Information Coefficient"""
+        try:
+            from scipy.stats import spearmanr
+            
+            # Remove NaN values
+            valid_idx = ~(feature_series.isna() | targets.isna())
+            if valid_idx.sum() < 50:
+                return False
+            
+            clean_feature = feature_series[valid_idx]
+            clean_targets = targets[valid_idx]
+            
+            # Calculate Information Coefficient (Spearman correlation)
+            ic, p_value = spearmanr(clean_feature, clean_targets)
+            
+            # Feature is valid if it shows predictive power
+            is_valid = abs(ic) > min_ic and p_value < 0.1
+            
+            self.feature_scores[feature_name] = {
+                'information_coefficient': ic,
+                'p_value': p_value,
+                'is_valid': is_valid
+            }
+            
+            if is_valid:
+                self.validated_features.append(feature_name)
+                logger.info(f"✅ Feature '{feature_name}' validated: IC={ic:.4f}, p={p_value:.4f}")
+            
+            return is_valid
+            
+        except Exception as e:
+            logger.warning(f"Error validating feature {feature_name}: {e}")
+            return False
+
+    def market_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """ADVANCED market microstructure signals"""
+        features = pd.DataFrame(index=df.index)
+        
+        open_price = df['open']
+        close = df['close']
+        high = df['high']
+        low = df['low']
+        volume = df['volume']
+        
+        # INTRADAY PATTERNS
+        intraday_return = (close - open_price) / open_price
+        overnight_return = (open_price - close.shift(1)) / close.shift(1)
+        
+        features['intraday_return'] = intraday_return
+        features['overnight_return'] = overnight_return
+        
+        # Return decomposition significance
+        total_return = close.pct_change()
+        intraday_weight = abs(intraday_return) / (abs(intraday_return) + abs(overnight_return) + 1e-8)
+        features['intraday_weight'] = intraday_weight
+        
+        # GAP ANALYSIS (ENHANCED)
+        gap_size = (open_price - close.shift(1)) / close.shift(1)
+        features['gap_size'] = gap_size
+        
+        # Gap follow-through (does gap get filled?)
+        gap_up_mask = gap_size > 0.005
+        gap_down_mask = gap_size < -0.005
+        
+        gap_fill_up = gap_up_mask & (low <= close.shift(1))
+        gap_fill_down = gap_down_mask & (high >= close.shift(1))
+        
+        features['gap_fill_probability'] = (gap_fill_up | gap_fill_down).rolling(20).mean()
+        
+        # VOLUME ANALYSIS
+        volume_ma = volume.rolling(20).mean()
+        features['volume_ratio'] = volume / (volume_ma + 1e-8)
+        
+        # Volume-weighted returns
+        volume_weight = volume / volume.rolling(20).sum()
+        features['volume_weighted_return'] = (total_return * volume_weight).rolling(20).sum()
+        
+        # REVERSAL PATTERNS
+        # Hammer/Doji detection (improved)
+        body_size = abs(close - open_price)
+        total_range = high - low + 1e-8
+        upper_shadow = high - np.maximum(close, open_price)
+        lower_shadow = np.minimum(close, open_price) - low
+        
+        features['body_ratio'] = body_size / total_range
+        features['upper_shadow_ratio'] = upper_shadow / total_range
+        features['lower_shadow_ratio'] = lower_shadow / total_range
+        
+        # Hammer pattern (small body, long lower shadow)
+        features['hammer_signal'] = (
+            (features['body_ratio'] < 0.3) & 
+            (features['lower_shadow_ratio'] > 0.6) &
+            (close.pct_change() < -0.01)  # After decline
+        ).astype(int)
+        
+        return features.fillna(0)
+
+    
+    def cross_asset_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Features that might correlate with broader market"""
+        features = pd.DataFrame(index=df.index)
+        
+        close = df['close']
+        returns = close.pct_change()
+        
+        # Volatility clustering
+        features['vol_cluster'] = (returns.abs() > returns.rolling(20).std() * 1.5).astype(int)
+        
+        # Serial correlation
+        features['serial_corr'] = returns.rolling(10).apply(
+            lambda x: x.autocorr(lag=1) if len(x) > 1 else 0
+        ).fillna(0)
+        
+        # Trend persistence
+        trend_5 = (close > close.rolling(5).mean()).astype(int)
+        features['trend_persistence'] = trend_5.rolling(5).mean()
+        
+        return features.fillna(0)
+    
+    def market_correlation_features(self, df: pd.DataFrame, market_data: pd.DataFrame = None) -> pd.DataFrame:
+        """Add market correlation and sector features"""
+        features = pd.DataFrame(index=df.index)
+        close = df['close']
+        returns = close.pct_change()
+    
+        
+        # Download Nifty 50 for market correlation if not provided
+        if market_data is None:
+            try:
+                import yfinance as yf
+                nifty = yf.download("^NSEI", period="2y")['Close']
+                nifty_returns = nifty.pct_change()
+            except:
+                nifty_returns = returns  # Fallback to stock returns
+        else:
+            nifty_returns = market_data['close'].pct_change()
+        
+        # Rolling correlation with market
+        features['market_corr_30d'] = returns.rolling(30).corr(nifty_returns)
+        features['market_corr_60d'] = returns.rolling(60).corr(nifty_returns)
+        
+        # Beta calculation
+        covariance = returns.rolling(60).cov(nifty_returns)
+        market_variance = nifty_returns.rolling(60).var()
+        features['beta_60d'] = safe_divide(covariance, market_variance)
+        
+        # Relative strength vs market
+        if market_data is not None:
+            stock_perf = (close / close.rolling(20).mean() - 1)
+            market_perf = (market_data['close'] / market_data['close'].rolling(20).mean() - 1)
+            features['relative_strength'] = stock_perf - market_perf
+        else:
+            features['relative_strength'] = 0
+        
+        # Market regime alignment
+        features['market_trend_align'] = (
+            (returns > 0).astype(int) * (nifty_returns > 0).astype(int)
+        )
+        
+        return features.fillna(0)
+
+    def build_features(self, df: pd.DataFrame, horizon: int = 1, market_data: pd.DataFrame = None) -> pd.DataFrame:
+        """ENHANCED feature building with validation"""
+        
+        # Add signal validator
+        signal_validator = SignalValidator()
+        
+        # Build all features (existing code)
+        tech_features = self.technical_indicators(df)
+        micro_features = self.market_microstructure_features(df)
+        cross_features = self.cross_asset_features(df)
+        time_features = self.time_based_features(df)
+        
+        if market_data is not None:
+            market_corr_features = self.market_correlation_features(df, market_data)
+            all_features = pd.concat([tech_features, micro_features, cross_features, 
+                                    time_features, market_corr_features], axis=1)
+        else:
+            market_corr_features = self.market_correlation_features(df, None)
+            all_features = pd.concat([tech_features, micro_features, cross_features,
+                                    time_features, market_corr_features], axis=1)
+        
+        # Get regime features
+        regime_features = self.regime_detector.detect(df)
+        all_features = pd.concat([all_features, regime_features], axis=1)
+        
+        # CREATE TARGETS FIRST
+        close = df['close']
+        open_next = df['open'].shift(-horizon)
+        close_next = df['close'].shift(-horizon)
+        forward_return = (close_next - open_next) / open_next
+        
+        # VALIDATE FEATURES INDIVIDUALLY
+        logger.info("🧪 Starting individual feature validation...")
+        validated_features = pd.DataFrame(index=df.index)
+        
+        for feature_name in all_features.columns:
+            if signal_validator.test_feature_predictive_power(
+                all_features[feature_name], forward_return, feature_name, min_ic=0.015
+            ):
+                validated_features[feature_name] = all_features[feature_name]
+        
+        if len(validated_features.columns) == 0:
+            logger.warning("⚠️ No features passed validation, using top 20 by correlation")
+            # Fallback: use top features by absolute correlation
+            correlations = all_features.corrwith(forward_return).abs().sort_values(ascending=False)
+            top_features = correlations.head(20).index
+            validated_features = all_features[top_features]
+        else:
+            logger.info(f"✅ {len(validated_features.columns)} features passed validation")
+        
+        # Add targets
+        validated_features['target_return'] = forward_return
+        validated_features['target_direction'] = (forward_return > 0).astype(int)
+        
+        # Clean and return
+        return self._clean_features(validated_features)
+
+
+
+    def _clean_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Clean features to remove infinities and extreme values"""
+        logger.info("Cleaning features for ML compatibility...")
+        
+        # Ensure all features are numeric
+        for col in features.columns:
+            features[col] = pd.to_numeric(features[col], errors='coerce')
+        
+        # Replace infinities with NaN
+        features = features.replace([np.inf, -np.inf], np.nan)
+        
+        # Fill NaN values with appropriate defaults
+        for col in features.columns:
+            if col in ['target_return', 'target_direction']:
+                # Don't modify target variables
+                continue
+                
+            # Fill NaN with median (more robust than mean for outliers)
+            if features[col].isna().any():
+                median_val = features[col].median()
+                if pd.isna(median_val):  # If all values are NaN
+                    median_val = 0.0
+                features[col] = features[col].fillna(median_val)
+        
+        # Cap extreme values (winsorization)
+        for col in features.columns:
+            if col in ['target_return', 'target_direction']:
+                continue
+                
+            # Cap at 99.5th and 0.5th percentiles
+            upper_cap = features[col].quantile(0.995)
+            lower_cap = features[col].quantile(0.005)
+            
+            if not pd.isna(upper_cap) and not pd.isna(lower_cap):
+                features[col] = features[col].clip(lower=lower_cap, upper=upper_cap)
+        
+        # Final check: remove any remaining problematic values
+        features = features.select_dtypes(include=[np.number])  # Keep only numeric columns
+        
+        # Remove any remaining rows with NaN in targets
+        features = features.dropna(subset=['target_return', 'target_direction'])
+        
+        logger.info(f"Feature cleaning complete. Shape: {features.shape}")
+        return features
+    
+    def time_based_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add time-based cyclical features"""
+        features = pd.DataFrame(index=df.index)
+        
+        # Day of week effects (Indian markets)
+        features['day_of_week'] = df.index.dayofweek
+        features['is_monday'] = (df.index.dayofweek == 0).astype(int)
+        features['is_friday'] = (df.index.dayofweek == 4).astype(int)
+        
+        # Month effects
+        features['month'] = df.index.month
+        features['is_march'] = (df.index.month == 3).astype(int)  # Financial year end
+        features['is_october'] = (df.index.month == 10).astype(int)  # Festive season
+        
+        # Cyclical encoding for smooth transitions
+        features['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+        features['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+        features['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
+        features['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
+        
+        return features
+    
+    def create_multi_horizon_targets(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create targets for multiple prediction horizons"""
+        close = df['close']
+        open_price = df['open']
+        
+        targets = pd.DataFrame(index=df.index)
+        
+        # 1-day target (existing)
+        open_next1 = open_price.shift(-1)
+        close_next1 = close.shift(-1)
+        ret_1d = (close_next1 - open_next1) / open_next1
+        targets['target_return_1d'] = ret_1d
+        
+        # 2-day target
+        open_next2 = open_price.shift(-2)
+        close_next2 = close.shift(-2)
+        ret_2d = (close_next2 - open_next1) / open_next1
+        targets['target_return_2d'] = ret_2d
+        
+        # 3-day target
+        open_next3 = open_price.shift(-3)
+        close_next3 = close.shift(-3)
+        ret_3d = (close_next3 - open_next1) / open_next1
+        targets['target_return_3d'] = ret_3d
+        
+        # Ensemble target: weighted combination
+        targets['target_return_ensemble'] = (
+            ret_1d * 0.5 + ret_2d * 0.3 + ret_3d * 0.2
+        )
+        
+        # Direction targets
+        targets['target_direction_1d'] = (ret_1d > 0).astype(int)
+        targets['target_direction_2d'] = (ret_2d > 0).astype(int) 
+        targets['target_direction_3d'] = (ret_3d > 0).astype(int)
+        targets['target_direction_ensemble'] = (targets['target_return_ensemble'] > 0).astype(int)
+        
+        return targets
+
+
+# =========================
+# Advanced ML Pipeline
+# =========================
+class AdvancedMLPipeline:
+    """Enhanced ML pipeline with ensemble methods and proper validation"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.pipeline: Optional[Pipeline] = None
+        self.feature_importance_: Optional[pd.Series] = None
+        self.calibration_curve_: Optional[Dict] = None
+        
+    def create_ensemble(self) -> VotingClassifier:
+        """Create ensemble focused on SIGNAL QUALITY"""
+        models = []
+        
+        # Random Forest with better parameters for financial data
+        rf = RandomForestClassifier(
+            n_estimators=500,  # More trees
+            max_depth=8,       # Deeper trees
+            min_samples_split=20,  # Prevent overfitting
+            min_samples_leaf=10,   # Prevent overfitting  
+            max_features='sqrt',   # Feature randomness
+            class_weight='balanced_subsample',  # Handle imbalance
+            bootstrap=True,
+            random_state=42
+        )
+        models.append(('rf', rf))
+        
+        # Extra Trees (more randomness)
+        from sklearn.ensemble import ExtraTreesClassifier
+        et = ExtraTreesClassifier(
+            n_estimators=500,
+            max_depth=10,
+            min_samples_split=20,
+            min_samples_leaf=10,
+            max_features='sqrt',
+            class_weight='balanced_subsample',
+            random_state=42
+        )
+        models.append(('et', et))
+        
+        # XGBoost with financial-tuned parameters
+        if XGB_AVAILABLE:
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=500,
+                learning_rate=0.01,  # Slower learning
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.3,      # L1 regularization
+                reg_lambda=0.5,     # L2 regularization
+                scale_pos_weight=1.0,
+                random_state=42,
+                eval_metric='logloss',
+                early_stopping_rounds=50
+            )
+            models.append(('xgb', xgb_model))
+        
+        return VotingClassifier(estimators=models, voting='soft')
+
+    
+    def create_pipeline(self) -> Pipeline:
+        """Create full ML pipeline"""
+        steps = [
+            ('variance_threshold', VarianceThreshold(threshold=1e-6)),
+            ('feature_selection', SelectKBest(
+                score_func=mutual_info_classif, 
+                k=min(30, int(self.n_features_ * 0.6))  # Adaptive feature selection
+            )),
+            ('scaler', QuantileTransformer(
+                output_distribution='uniform',
+                n_quantiles=1000,
+                subsample=100000
+            )),
+            ('classifier', self.create_ensemble())
+        ]
+        
+        return Pipeline(steps)
+    
+    def fit(self, X: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> Dict[str, float]:
+        """Fit pipeline with time series cross-validation"""
+        self.n_features_ = X.shape[1]
+        self.X_train = X.copy()  # Store training data for feature importance
+        
+        # Create pipeline
+        base_pipeline = self.create_pipeline()
+        
+        # Time series split for proper validation
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        
+        # Calibrated classifier for better probability estimates
+        calibrated_clf = CalibratedClassifierCV(
+            estimator=base_pipeline,
+            method='isotonic',
+            cv=tscv
+        )
+        
+        # Fit calibrated classifier
+        logger.info("Fitting calibrated ensemble model...")
+        calibrated_clf.fit(X, y)
+        self.pipeline = calibrated_clf
+        
+        # Evaluate performance on last fold
+        last_metrics = self._evaluate_last_fold(X, y, tscv)
+        
+        # Extract feature importance if possible
+        try:
+            self._extract_feature_importance()
+        except Exception as e:
+            logger.warning(f"Could not extract feature importance: {e}")
+        
+        return last_metrics
+
+    
+    def _evaluate_last_fold(self, X: pd.DataFrame, y: pd.Series, tscv) -> Dict[str, float]:
+        """Evaluate performance on the last fold"""
+        splits = list(tscv.split(X))
+        if not splits:
+            return {}
+        
+        train_idx, test_idx = splits[-1]
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        # Create and fit model on training set
+        temp_pipeline = self.create_pipeline()
+        temp_pipeline.fit(X_train, y_train)
+        
+        # Predictions
+        y_prob = temp_pipeline.predict_proba(X_test)[:, 1]
+        y_pred = (y_prob > 0.5).astype(int)
+        
+        metrics = {
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred, zero_division=0),
+            'recall': recall_score(y_test, y_pred, zero_division=0),
+            'f1': f1_score(y_test, y_pred, zero_division=0),
+            'auc': roc_auc_score(y_test, y_prob)
+        }
+        
+        logger.info(f"Last fold validation metrics: {metrics}")
+        return metrics
+    
+    def _extract_feature_importance(self):
+        """Extract feature importance from the ensemble"""
+        try:
+            # Access calibrated classifiers
+            if hasattr(self.pipeline, 'calibrated_classifiers_'):
+                # Take the first calibrated classifier
+                first_calibrated = self.pipeline.calibrated_classifiers_[0]
+                base_estimator = first_calibrated
+                
+                # Navigate to the ensemble classifier
+                if hasattr(base_estimator, 'named_steps'):
+                    classifier = base_estimator.named_steps['classifier']
+                    
+                    importances = []
+                    for name, estimator in classifier.estimators_:
+                        if hasattr(estimator, 'feature_importances_'):
+                            importances.append(estimator.feature_importances_)
+                    
+                    if importances:
+                        avg_importance = np.mean(importances, axis=0)
+                        
+                        # Get feature names after transformation
+                        feature_selector = base_estimator.named_steps['feature_selection']
+                        selected_features = feature_selector.get_support(indices=True)
+                        
+                        # Map back to original feature names
+                        original_features = list(self.X_train.columns)
+                        selected_feature_names = [original_features[i] for i in selected_features]
+                        
+                        self.feature_importance_ = pd.Series(avg_importance, index=selected_feature_names)
+                        logger.info("Feature importance extraction successful")
+                        return
+                        
+            logger.warning("Could not extract feature importance - using alternative method")
+            
+        except Exception as e:
+            logger.warning(f"Feature importance extraction failed: {e}")
+
+
+    
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Get prediction probabilities"""
+        if self.pipeline is None:
+            raise RuntimeError("Model not fitted")
+        return self.pipeline.predict_proba(X)[:, 1]
+    
+    def get_feature_importance(self) -> Optional[pd.Series]:
+        """Get feature importance if available"""
+        return self.feature_importance_
+    def create_enhanced_ensemble(self) -> VotingClassifier:
+        """Create enhanced ensemble with more diverse models"""
+        models = []
+        
+        # More aggressive Gradient Boosting
+        gb = GradientBoostingClassifier(
+            n_estimators=300,
+            learning_rate=0.03,
+            max_depth=4,
+            subsample=0.7,
+            max_features='sqrt',
+            random_state=42
+        )
+        models.append(('gb', gb))
+        
+        # Balanced Random Forest
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=8,
+            min_samples_leaf=3,
+            max_features=0.6,
+            class_weight='balanced_subsample',
+            random_state=42
+        )
+        models.append(('rf', rf))
+        
+        # XGBoost with better parameters
+        if XGB_AVAILABLE:
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=300,
+                learning_rate=0.03,
+                max_depth=4,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=0.2,
+                reg_lambda=1.5,
+                scale_pos_weight=1.2,  # Handle class imbalance
+                random_state=42,
+                eval_metric='logloss'
+            )
+            models.append(('xgb', xgb_model))
+        
+        return VotingClassifier(estimators=models, voting='soft')
+   
+# =========================
+# Dynamic threshold optimization
+# =========================
+class DynamicThresholdOptimizer:
+    """Optimize thresholds dynamically based on market regimes and model confidence"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.regime_thresholds: Dict[str, float] = {
+            'default': 0.60,      
+            'high_vol': 0.65,    
+            'low_vol': 0.58,   
+            'uptrend': 0.58,      
+            'downtrend': 0.62     
+        }
+        
+    def optimize_by_regime(self, 
+                          probabilities: pd.Series,
+                          targets: pd.Series, 
+                          regimes: pd.DataFrame,
+                          returns: pd.Series) -> Dict[str, float]:
+        """Optimize thresholds for each market regime"""
+        
+        regime_thresholds = {}
+        
+        # Create regime codes
+        regime_codes = regimes.apply(lambda row: self._create_regime_code(row), axis=1)
+        unique_regimes = regime_codes.unique()
+        
+        for regime in unique_regimes:
+            mask = regime_codes == regime
+            if mask.sum() < 50:  # Need minimum samples
+                continue
+                
+            regime_probs = probabilities[mask]
+            regime_targets = targets[mask] 
+            regime_returns = returns[mask]
+            
+            # Optimize threshold for this regime
+            best_threshold = self._optimize_single_regime(
+                regime_probs, regime_targets, regime_returns
+            )
+            
+            regime_thresholds[regime] = best_threshold
+            
+        # Set default threshold
+        regime_thresholds['default'] = self.config.min_confidence
+        
+        logger.info(f"Optimized thresholds by regime: {regime_thresholds}")
+        return regime_thresholds
+    
+    def _create_regime_code(self, regime_row: pd.Series) -> str:
+        """Create regime code from regime features"""
+        vol_regime = int(regime_row.get('vol_regime', 0))
+        trend_regime = int(regime_row.get('trend_regime', 0))
+        stress = int(regime_row.get('stress_regime', 0))
+        return f"V{vol_regime}_T{trend_regime}_S{stress}"
+    
+    def _optimize_single_regime(self, 
+                               probabilities: pd.Series,
+                               targets: pd.Series,
+                               returns: pd.Series) -> float:
+        """Optimize threshold for single regime using Kelly criterion"""
+        
+        thresholds = np.arange(0.50, 0.80, 0.02)
+        best_threshold = 0.55
+        best_score = -np.inf
+        
+        for threshold in thresholds:
+            predictions = (probabilities > threshold).astype(int)
+            
+            if predictions.sum() == 0:  # No trades
+                continue
+                
+            # Calculate win rate and average win/loss
+            trade_returns = returns[predictions == 1]
+            
+            if len(trade_returns) < 5:
+                continue
+                
+            win_rate = (trade_returns > 0).mean()
+            avg_win = trade_returns[trade_returns > 0].mean() if (trade_returns > 0).any() else 0
+            avg_loss = abs(trade_returns[trade_returns < 0].mean()) if (trade_returns < 0).any() else 0.01
+            
+            # Kelly criterion score
+            if avg_loss > 0:
+                win_loss_ratio = avg_win / avg_loss
+                kelly_score = win_rate - (1 - win_rate) / win_loss_ratio
+                
+                # Penalize if too few trades
+                frequency_penalty = min(1.0, len(trade_returns) / 20)
+                score = kelly_score * frequency_penalty
+                
+                if score > best_score:
+                    best_score = score
+                    best_threshold = threshold
+        
+        return best_threshold
+    
+    def get_threshold(self, regime_row: pd.Series) -> float:
+        """Get threshold for current regime"""
+        regime_code = self._create_regime_code(regime_row)
+        return self.regime_thresholds.get(regime_code, self.config.min_confidence)
+
+# =========================
+# Advanced position sizing
+# =========================
+class KellyPositionSizer:
+    """Kelly criterion-based position sizing with risk controls"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        
+    def calculate_size(self, 
+                      capital: float,
+                      price: float, 
+                      probability: float,
+                      expected_return: float,
+                      volatility: float,
+                      max_position_value: float) -> float:
+        """Calculate position size using modified Kelly criterion"""
+        
+        # Estimate win rate and win/loss ratio from probability and expected return
+        win_rate = probability
+        
+        # Conservative estimates
+        avg_win = max(0.02, expected_return * 1.5)  # Conservative estimate
+        avg_loss = max(0.015, volatility * 1.2)      # Risk estimate
+        
+        win_loss_ratio = avg_win / avg_loss
+        
+        # Kelly fraction
+        kelly_f = win_rate - (1 - win_rate) / win_loss_ratio
+        
+        # Apply safety factors
+        kelly_f = max(0, min(kelly_f, 0.25))  # Cap at 25%
+        kelly_f *= self.config.kelly_fraction   # Additional safety factor
+        
+        # Volatility adjustment
+        target_vol = self.config.target_annual_vol / np.sqrt(252)  # Daily
+        vol_adjustment = target_vol / max(volatility, 0.01)
+        vol_adjustment = min(vol_adjustment, 2.0)  # Cap adjustment
+        
+        # Final position value
+        position_value = capital * kelly_f * vol_adjustment
+        position_value = min(position_value, max_position_value)
+        
+        # Convert to shares
+        shares = position_value / price
+        
+        return max(0, shares)
+
+# =========================
+# Advanced risk management
+# =========================
+class AdvancedRiskManager:
+    """Comprehensive risk management system"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.position_sizer = KellyPositionSizer(config)
+        self.drawdown_history: List[float] = []
+        
+    def calculate_position_size(self,
+                               capital: float,
+                               price: float,
+                               probability: float, 
+                               volatility: float,
+                               atr: float) -> float:
+        """Calculate position size with multiple constraints"""
+        
+        # Maximum position value based on capital
+        max_position_value = capital * self.config.max_position_pct
+        
+        # Expected return estimate (could be enhanced with more sophisticated models)
+        expected_return = (probability - 0.5) * 0.04  # Simple mapping
+        
+        # Kelly-based sizing
+        kelly_size = self.position_sizer.calculate_size(
+            capital, price, probability, expected_return, volatility, max_position_value
+        )
+        
+        # Volatility-based sizing (alternative approach)
+        vol_target = self.config.target_annual_vol / np.sqrt(252)
+        vol_size = (vol_target * capital) / (volatility * price) if volatility > 0 else 0
+        
+        # Use minimum of both approaches for safety
+        final_size = min(kelly_size, vol_size)
+        
+        # Apply additional constraints
+        final_size = min(final_size, max_position_value / price)
+        
+        return max(0, math.floor(final_size))
+    
+    def should_enter_position(self,
+                             probability: float,
+                             regime_row: pd.Series,
+                             current_drawdown: float) -> bool:
+        """Determine if position entry is allowed"""
+        
+        # Check minimum confidence
+        if probability < self.config.min_confidence:
+            return False
+            
+        # Check drawdown limit
+        if current_drawdown < -self.config.max_drawdown:
+            return False
+            
+        # Use regime detector
+        regime_detector = AdvancedRegimeDetector()
+        if not regime_detector.allow_trade(regime_row):
+            return False
+            
+        return True
+    
+    def calculate_stop_loss(self, entry_price: float, atr: float) -> float:
+        """Calculate stop loss level"""
+        return entry_price - (self.config.stop_atr_multiplier * atr)
+    
+    def calculate_take_profit(self, entry_price: float, atr: float) -> float:
+        """Calculate take profit level"""
+        return entry_price + (self.config.tp_atr_multiplier * atr)
+    
+    def calculate_trailing_stop(self, entry_price: float, highest_price: float, atr: float) -> float:
+        """Calculate trailing stop level"""
+        return highest_price - (self.config.trailing_atr_multiplier * atr)
+    
+    def should_exit_position(self,
+                           entry_price: float,
+                           current_price: float,
+                           highest_price: float,
+                           lowest_price: float,
+                           atr: float,
+                           days_held: int) -> Tuple[bool, str]:
+        """Determine if position should be exited"""
+        
+        # Stop loss
+        stop_level = self.calculate_stop_loss(entry_price, atr)
+        if lowest_price <= stop_level:
+            return True, "stop_loss"
+        
+        # Take profit
+        tp_level = self.calculate_take_profit(entry_price, atr)
+        if highest_price >= tp_level:
+            return True, "take_profit"
+        
+        # Trailing stop (only if profitable)
+        if highest_price > entry_price * 1.01:  # At least 1% profit
+            trailing_level = self.calculate_trailing_stop(entry_price, highest_price, atr)
+            if lowest_price <= trailing_level:
+                return True, "trailing_stop"
+        
+        # Time-based exit
+        if days_held >= self.config.max_hold_days:
+            return True, "time_exit"
+            
+        return False, "hold"
+
+# =========================
+# Enhanced cost model
+# =========================
+class CostModel:
+    """Comprehensive transaction cost model for Indian markets"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        # Indian market costs (in basis points)
+        self.brokerage_rate = 0.0005      # 0.05%
+        self.stt_rate = 0.001             # 0.10% on sell side
+        self.exchange_charges = 0.0000325 # ~0.00325%
+        self.sebi_charges = 10 / 1e7      # â‚¹10 per crore
+        self.gst_rate = 0.18              # 18% on brokerage + exchange charges
+        self.stamp_duty = 0.00015         # 0.015% on buy side
+        
+    def calculate_transaction_cost(self, side: str, notional_value: float) -> float:
+        """Calculate total transaction cost"""
+        
+        # Brokerage
+        brokerage = notional_value * self.brokerage_rate
+        
+        # Exchange charges
+        exchange = notional_value * self.exchange_charges
+        
+        # SEBI charges
+        sebi = notional_value * self.sebi_charges
+        
+        # GST on brokerage and exchange charges
+        gst = (brokerage + exchange) * self.gst_rate
+        
+        # STT (only on sell side for equity delivery)
+        stt = notional_value * self.stt_rate if side.lower() == 'sell' else 0
+        
+        # Stamp duty (only on buy side)
+        stamp = notional_value * self.stamp_duty if side.lower() == 'buy' else 0
+        
+        total_cost = brokerage + exchange + sebi + gst + stt + stamp
+        
+        return total_cost
+    
+    def calculate_market_impact(self, trade_size: float, avg_volume: float, volatility: float) -> float:
+        """Estimate market impact cost"""
+        
+        if avg_volume <= 0:
+            return 0.01  # 1% default impact
+            
+        # Participation rate
+        participation = trade_size / avg_volume
+        
+        # Square root model for market impact
+        impact = self.config.impact_coefficient * math.sqrt(participation) * volatility
+        
+        return min(impact, 0.05)  # Cap at 5%
+
+# =========================
+# Enhanced backtester
+# =========================
+class Backtester:
+    """Comprehensive backtesting engine with walk-forward analysis"""
+    
+    def __init__(self, 
+                 price_data: pd.DataFrame,
+                 feature_data: pd.DataFrame, 
+                 regime_data: pd.DataFrame,
+                 config: TradingConfig):
+        
+        self.price_data = price_data.sort_index()
+        self.feature_data = feature_data.sort_index()
+        self.regime_data = regime_data.sort_index()
+        self.config = config
+        self.cost_model = CostModel(config)
+        self.risk_manager = AdvancedRiskManager(config)
+        
+    def run_backtest(self, 
+                    model: AdvancedMLPipeline,
+                    threshold_optimizer: DynamicThresholdOptimizer,
+                    initial_capital: float = 100000) -> Dict[str, Any]:
+        """Run comprehensive backtest"""
+        
+        logger.info("Starting enhanced backtest...")
+        
+        # Align all data
+        common_index = (self.price_data.index
+                       .intersection(self.feature_data.index)
+                       .intersection(self.regime_data.index))
+        
+        prices = self.price_data.loc[common_index]
+        features = self.feature_data.loc[common_index]
+        regimes = self.regime_data.loc[common_index]
+        
+        # Prepare features and targets
+        X = features.drop(['target_return', 'target_direction'], axis=1, errors='ignore')
+        y = features['target_direction'].astype(int)
+        returns = features['target_return']
+        
+        # Train model with walk-forward validation
+        logger.info("Training model...")
+        model_metrics = model.fit(X, y, n_splits=5)
+        
+        # Get predictions
+        probabilities = pd.Series(model.predict_proba(X), index=X.index)
+        
+        # Optimize thresholds
+        logger.info("Optimizing thresholds...")
+        threshold_optimizer.regime_thresholds = threshold_optimizer.optimize_by_regime(
+            probabilities, y, regimes, returns
+        )
+        
+        # Run simulation
+        results = self._simulate_trading(
+            prices, features, regimes, probabilities, 
+            threshold_optimizer, initial_capital
+        )
+        
+        # Add model metrics
+        results['model_metrics'] = model_metrics
+        results['feature_importance'] = model.get_feature_importance()
+        
+        return results
+    
+    def _simulate_trading(self,
+                         prices: pd.DataFrame,
+                         features: pd.DataFrame, 
+                         regimes: pd.DataFrame,
+                         probabilities: pd.Series,
+                         threshold_optimizer: DynamicThresholdOptimizer,
+                         initial_capital: float) -> Dict[str, Any]:
+        """Simulate trading strategy"""
+        
+        # Initialize tracking variables
+        capital = initial_capital
+        position_shares = 0.0
+        position_entry_price = 0.0
+        position_highest_price = 0.0
+        position_days_held = 0
+        
+        # Tracking lists
+        nav_history = []
+        position_history = []
+        trade_history = []
+        
+        # Calculate average daily volume for sizing constraints
+        avg_volume = prices['volume'].rolling(20).mean().fillna(method='bfill')
+        
+        for i in range(1, len(prices) - 1):
+            current_date = prices.index[i]
+            current_bar = prices.iloc[i]
+            next_bar = prices.iloc[i + 1]
+            
+            current_regime = regimes.loc[current_date]
+            current_prob = probabilities.loc[current_date]
+            
+            # Get volatility and ATR
+            current_vol = features.loc[current_date, 'vol_20'] if 'vol_20' in features.columns else 0.02
+            current_atr = features.loc[current_date, 'atr_14'] if 'atr_14' in features.columns else current_bar['high'] - current_bar['low']
+            
+            # Update NAV
+            nav = capital + position_shares * current_bar['close']
+            nav_history.append(nav)
+            position_history.append(position_shares)
+            
+            # Calculate current drawdown
+            peak_nav = max(nav_history) if nav_history else initial_capital
+            current_drawdown = (nav - peak_nav) / peak_nav
+            
+            # Manage existing position
+            if position_shares > 0:
+                position_days_held += 1
+                position_highest_price = max(position_highest_price, current_bar['high'])
+                
+                # Check exit conditions
+                should_exit, exit_reason = self.risk_manager.should_exit_position(
+                    position_entry_price,
+                    current_bar['close'],
+                    position_highest_price,
+                    current_bar['low'],
+                    current_atr,
+                    position_days_held
+                )
+                
+                if should_exit:
+                    # Execute exit at next open
+                    exit_price = next_bar['open']
+                    
+                    # Calculate market impact
+                    impact_cost = self.cost_model.calculate_market_impact(
+                        position_shares * exit_price,
+                        avg_volume.loc[current_date] * current_bar['close'],
+                        current_vol
+                    )
+                    
+                    # Apply slippage and costs
+                    actual_exit_price = exit_price * (1 - impact_cost)
+                    notional = position_shares * actual_exit_price
+                    transaction_cost = self.cost_model.calculate_transaction_cost('sell', notional)
+                    
+                    # Update capital
+                    capital += notional - transaction_cost
+                    
+                    # Record trade
+                    pnl = (actual_exit_price - position_entry_price) * position_shares - transaction_cost
+                    trade_history.append({
+                        'exit_date': next_bar.name,
+                        'exit_price': actual_exit_price,
+                        'shares': position_shares,
+                        'pnl': pnl,
+                        'exit_reason': exit_reason,
+                        'days_held': position_days_held,
+                        'return_pct': pnl / (position_entry_price * position_shares)
+                    })
+                    
+                    # Reset position
+                    position_shares = 0.0
+                    position_entry_price = 0.0
+                    position_highest_price = 0.0
+                    position_days_held = 0
+                    
+                    continue
+            
+            # Check for new position entry
+            if position_shares == 0:
+                threshold = threshold_optimizer.get_threshold(current_regime)
+                
+                if (current_prob > threshold and 
+                    self.risk_manager.should_enter_position(current_prob, current_regime, current_drawdown)):
+                    
+                    # Calculate position size
+                    entry_price = next_bar['open']
+                    position_size = self.risk_manager.calculate_position_size(
+                        capital, entry_price, current_prob, current_vol, current_atr
+                    )
+                    
+                    if position_size > 0:
+                        # Calculate market impact
+                        impact_cost = self.cost_model.calculate_market_impact(
+                            position_size * entry_price,
+                            avg_volume.loc[current_date] * current_bar['close'],
+                            current_vol
+                        )
+                        
+                        # Apply slippage and costs
+                        actual_entry_price = entry_price * (1 + impact_cost)
+                        notional = position_size * actual_entry_price
+                        transaction_cost = self.cost_model.calculate_transaction_cost('buy', notional)
+                        
+                        # Check if we have enough capital
+                        total_cost = notional + transaction_cost
+                        if total_cost <= capital:
+                            # Execute trade
+                            capital -= total_cost
+                            position_shares = position_size
+                            position_entry_price = actual_entry_price
+                            position_highest_price = actual_entry_price
+                            position_days_held = 0
+                            
+                            # Record trade entry
+                            trade_history.append({
+                                'entry_date': next_bar.name,
+                                'entry_price': actual_entry_price,
+                                'shares': position_size,
+                                'probability': current_prob,
+                                'regime': threshold_optimizer._create_regime_code(current_regime),
+                                'transaction_cost': transaction_cost
+                            })
+        
+        # Convert to series
+        nav_series = pd.Series(nav_history, index=prices.index[1:-1])
+        position_series = pd.Series(position_history, index=prices.index[1:-1])
+        returns_series = nav_series.pct_change().fillna(0)
+        
+        # Calculate performance metrics
+        performance_stats = self._calculate_performance_stats(nav_series, returns_series, trade_history)
+        
+        return {
+            'nav_series': nav_series,
+            'position_series': position_series,
+            'returns_series': returns_series,
+            'trade_history': trade_history,
+            'performance_stats': performance_stats
+        }
+    
+    def _calculate_performance_stats(self, 
+                                   nav_series: pd.Series,
+                                   returns_series: pd.Series, 
+                                   trade_history: List[Dict]) -> Dict[str, float]:
+        """Calculate comprehensive performance statistics"""
+        
+        if len(nav_series) == 0:
+            return {}
+        
+        initial_nav = nav_series.iloc[0]
+        final_nav = nav_series.iloc[-1]
+        
+        # Basic metrics
+        total_return = (final_nav / initial_nav) - 1
+        cagr_val = cagr(returns_series)
+        sharpe_val = sharpe_ratio(returns_series)
+        sortino_val = sortino_ratio(returns_series)
+        
+        # Risk metrics
+        max_dd = max_drawdown((1 + returns_series).cumprod())
+        calmar_val = calmar_ratio(returns_series)
+        omega_val = omega_ratio(returns_series)
+        
+        # Trade statistics
+        completed_trades = [t for t in trade_history if 'pnl' in t]
+        
+        if completed_trades:
+            winning_trades = [t for t in completed_trades if t['pnl'] > 0]
+            losing_trades = [t for t in completed_trades if t['pnl'] <= 0]
+            
+            win_rate = len(winning_trades) / len(completed_trades)
+            avg_win = np.mean([t['pnl'] for t in winning_trades]) if winning_trades else 0
+            avg_loss = np.mean([abs(t['pnl']) for t in losing_trades]) if losing_trades else 0
+            profit_factor = abs(avg_win / avg_loss) if avg_loss > 0 else float('inf')
+            
+            avg_holding_period = np.mean([t['days_held'] for t in completed_trades])
+        else:
+            win_rate = 0
+            avg_win = 0
+            avg_loss = 0
+            profit_factor = 0
+            avg_holding_period = 0
+        
+        return {
+            'total_return': total_return,
+            'cagr': cagr_val,
+            'sharpe_ratio': sharpe_val,
+            'sortino_ratio': sortino_val,
+            'max_drawdown': max_dd,
+            'calmar_ratio': calmar_val,
+            'omega_ratio': omega_val,
+            'win_rate': win_rate,
+            'profit_factor': profit_factor,
+            'num_trades': len(completed_trades),
+            'avg_holding_period': avg_holding_period,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss
+        }
+
+# =========================
+# Enhanced data manager
+# =========================
+class DataManager:
+    """Data management with multiple data sources"""
+    
+    INDIAN_BLUE_CHIPS = {
+        'RELIANCE': 'RELIANCE.NS',
+        'TCS': 'TCS.NS', 
+        'HDFCBANK': 'HDFCBANK.NS',
+        'INFY': 'INFY.NS',
+        'HINDUNILVR': 'HINDUNILVR.NS',
+        'ICICIBANK': 'ICICIBANK.NS',
+        'KOTAKBANK': 'KOTAKBANK.NS',
+        'BHARTIARTL': 'BHARTIARTL.NS',
+        'ITC': 'ITC.NS',
+        'ASIANPAINT': 'ASIANPAINT.NS',
+        'MARUTI': 'MARUTI.NS',
+        'AXISBANK': 'AXISBANK.NS',
+        'LT': 'LT.NS',
+        'SUNPHARMA': 'SUNPHARMA.NS',
+        'TITAN': 'TITAN.NS',
+        'ULTRACEMCO': 'ULTRACEMCO.NS',
+        'NESTLEIND': 'NESTLEIND.NS',
+        'WIPRO': 'WIPRO.NS',
+        'JSWSTEEL': 'JSWSTEEL.NS',
+        'TATAMOTORS': 'TATAMOTORS.NS',
+        'HCLTECH': 'HCLTECH.NS',
+        'POWERGRID': 'POWERGRID.NS',
+        'NTPC': 'NTPC.NS',
+        'ONGC': 'ONGC.NS',
+        'COALINDIA': 'COALINDIA.NS'
+    }
+    
+    def __init__(self):
+        if not YF_AVAILABLE:
+            raise RuntimeError("yfinance not available. Please install: pip install yfinance")
+    
+    def download_data(self, 
+                     symbol: str, 
+                     period: str = "3y", 
+                     interval: str = "1d") -> pd.DataFrame:
+        """Download price data with error handling"""
+        
+        # Get yfinance symbol
+        yf_symbol = self.INDIAN_BLUE_CHIPS.get(symbol, 
+                                              symbol if symbol.endswith('.NS') else f"{symbol}.NS")
+        
+        logger.info(f"Downloading data for {yf_symbol}...")
+        
+        try:
+            ticker = yf.Ticker(yf_symbol)
+            data = ticker.history(period=period, interval=interval)
+            
+            if data.empty:
+                raise ValueError(f"No data returned for {yf_symbol}")
+            
+            # Clean and standardize data
+            data = data.reset_index()
+            data.columns = [col.lower().replace(' ', '_') for col in data.columns]
+            
+            # Handle date column
+            date_col = 'date' if 'date' in data.columns else 'datetime'
+            if date_col in data.columns:
+                data = data.rename(columns={date_col: 'timestamp'})
+            
+            data = data.set_index('timestamp')
+            
+            # Validate required columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            missing_cols = [col for col in required_cols if col not in data.columns]
+            if missing_cols:
+                raise ValueError(f"Missing required columns: {missing_cols}")
+            
+            # Clean data
+            data = self._clean_price_data(data)
+            
+            logger.info(f"Downloaded {len(data)} bars for {yf_symbol}")
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error downloading data for {yf_symbol}: {e}")
+            raise
+    
+    def _clean_price_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Clean price data"""
+        
+        # Remove rows with missing OHLC data
+        data = data.dropna(subset=['open', 'high', 'low', 'close'])
+        
+        # Remove rows where high < low (data errors)
+        data = data[data['high'] >= data['low']]
+        
+        # Remove rows with zero volume (if volume exists)
+        if 'volume' in data.columns:
+            data = data[data['volume'] > 0]
+        
+        # Remove extreme outliers (price changes > 50% in one day)
+        returns = data['close'].pct_change()
+        data = data[abs(returns) < 0.5]
+        
+        # Ensure proper data types
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+        
+        return data
+    def download_market_index(self, period: str = "2y") -> pd.DataFrame:
+        """Download Nifty 50 index data for market correlation"""
+        try:
+            ticker = yf.Ticker("^NSEI")  # Nifty 50 index
+            data = ticker.history(period=period, interval="1d")
+            
+            if data.empty:
+                logger.warning("No Nifty data available, market correlation features will use fallback")
+                return None
+                
+            # Clean and standardize
+            data = data.reset_index()
+            data.columns = [col.lower().replace(' ', '_') for col in data.columns]
+            data = data.set_index('date' if 'date' in data.columns else data.columns[0])
+            
+            return self._clean_price_data(data)
+            
+        except Exception as e:
+            logger.warning(f"Failed to download market index: {e}")
+            return None
+
+# =========================
+# Main enhanced trading bot
+# =========================
+class AITradingBot:
+    """Institution-level AI trading bot with advanced features"""
+    
+    def __init__(self, config: Optional[TradingConfig] = None):
+        self.config = config or TradingConfig()
+        self.data_manager = DataManager()
+        self.feature_builder = FeatureBuilder()
+        self.model = AdvancedMLPipeline(self.config)
+        self.threshold_optimizer = DynamicThresholdOptimizer(self.config)
+        
+    def run_analysis(self, 
+                symbol: str = 'TATAMOTORS',
+                period: str = '3y',
+                initial_capital: float = 100000) -> Dict[str, Any]:
+        """Run complete trading analysis"""
+        
+        logger.info(f"Starting analysis for {symbol}")
+        
+        try:
+            # 1. Download data
+            price_data = self.data_manager.download_data(symbol, period)
+            
+            # 2. Download market index data (NEW!)
+            logger.info("Downloading market index data...")
+            market_data = self.data_manager.download_market_index(period)
+            
+            # 3. Build features with market correlation (UPDATED!)
+            logger.info("Building features...")
+            feature_data = self.feature_builder.build_features(price_data, market_data=market_data)
+            
+            # Rest remains the same...
+            logger.info("Detecting market regimes...")
+            regime_data = self.feature_builder.regime_detector.detect(price_data)
+            
+            backtester = Backtester(price_data, feature_data, regime_data, self.config)
+            results = backtester.run_backtest(self.model, self.threshold_optimizer, initial_capital)
+            
+            self._print_analysis_report(symbol, results)
+            return results
+            
+        except Exception as e:
+            logger.error(f"Analysis failed: {e}")
+            raise
+
+    
+    def _print_analysis_report(self, symbol: str, results: Dict[str, Any]):
+        """Enhanced analysis report with signal quality focus"""
+        
+        stats = results['performance_stats']
+        model_metrics = results.get('model_metrics', {})
+        
+        print("\n" + "=" * 90)
+        print(f"🎯 ENHANCED AI TRADING BOT ANALYSIS - {symbol}")
+        print("=" * 90)
+        
+        # SIGNAL QUALITY ASSESSMENT
+        auc = model_metrics.get('auc', 0)
+        accuracy = model_metrics.get('accuracy', 0)
+        
+        print(f"\n🧪 SIGNAL QUALITY ASSESSMENT:")
+        print(f"  Model AUC:        {auc:.3f}")
+        print(f"  Model Accuracy:   {accuracy:.3f}")
+        
+        if auc > 0.55:
+            print(f"  ✅ SIGNAL STRENGTH: STRONG - Good predictive power")
+        elif auc > 0.52:
+            print(f"  🟡 SIGNAL STRENGTH: MODERATE - Some predictive power") 
+        else:
+            print(f"  ❌ SIGNAL STRENGTH: WEAK - Poor predictive signals")
+            print(f"  💡 RECOMMENDATION: Need better feature engineering")
+        
+        # Enhanced performance metrics
+        sharpe = stats.get('sharpe_ratio', 0)
+        num_trades = stats.get('num_trades', 0)
+        win_rate = stats.get('win_rate', 0)
+        
+        print(f"\n📊 STRATEGY PERFORMANCE:")
+        print(f"  Total Return:     {stats.get('total_return', 0):.2%}")
+        print(f"  Sharpe Ratio:     {sharpe:.3f}")
+        print(f"  Win Rate:         {win_rate:.1%}")
+        print(f"  Number of Trades: {num_trades}")
+        print(f"  Max Drawdown:     {stats.get('max_drawdown', 0):.2%}")
+        
+        # Overall assessment
+        print(f"\n🎯 OVERALL ASSESSMENT:")
+        if auc > 0.55 and sharpe > 1.0:
+            print(f"🎉 EXCELLENT: Strong signals + great returns")
+        elif auc > 0.52 and sharpe > 0.5:
+            print(f"✅ GOOD: Decent signals + positive returns")
+        elif auc > 0.52:
+            print(f"🟡 PROMISING: Good signals but execution needs work")
+        else:
+            print(f"⚠️  NEEDS MAJOR IMPROVEMENT:")
+            print(f"     - Feature engineering is insufficient")
+            print(f"     - Model cannot distinguish profitable patterns")
+            print(f"     - Consider alternative data sources")
+        
+        print("\n" + "=" * 90)
+
+
+
+# =========================
+# Main execution
+# =========================
+def main():
+    """Main execution function"""
+    
+    # Initialize bot with custom config
+    config = TradingConfig(
+        target_annual_vol=0.15,
+        max_drawdown=0.10,
+        min_confidence=0.58,
+        kelly_fraction=0.20
+    )
+    
+    bot = AITradingBot(config)
+    
+    # Run analysis on multiple symbols
+    symbols = ['TATAMOTORS', 'RELIANCE', 'TCS', 'HDFCBANK']
+    
+    for symbol in symbols:
+        try:
+            logger.info(f"\nAnalyzing {symbol}...")
+            results = bot.run_analysis(
+                symbol=symbol,
+                period='2y',
+                initial_capital=500000  # 5 lakh INR
+            )
+            
+            # Optionally save results
+            # with open(f'{symbol}_analysis.json', 'w') as f:
+            #     json.dump(results['performance_stats'], f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Failed to analyze {symbol}: {e}")
+            continue
+
+
+if __name__ == "__main__":
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    
+    # Check dependencies
+    missing_deps = []
+    if not XGB_AVAILABLE:
+        missing_deps.append("xgboost")
+    if not LGB_AVAILABLE:
+        missing_deps.append("lightgbm") 
+    if not YF_AVAILABLE:
+        missing_deps.append("yfinance")
+        
+    if missing_deps:
+        logger.warning(f"Missing optional dependencies: {missing_deps}")
+        logger.info("Install with: pip install " + " ".join(missing_deps))
+    
+    # Run main analysis
+    main()
