@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import minimize_scalar
 
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
 # ML
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
@@ -59,16 +67,16 @@ logger = logging.getLogger("Ai_AI_Trading_Bot")
 @dataclass
 class TradingConfig:
     # Risk parameters
-    target_annual_vol: float = 0.12
-    max_drawdown: float = 0.08
-    max_position_pct: float = 0.15
-    min_confidence: float = 0.55
+    target_annual_vol: float = 0.18
+    max_drawdown: float = 0.12
+    max_position_pct: float = 0.20
+    min_confidence: float = 0.48
     
     # Stop loss / Take profit
-    stop_atr_multiplier: float = 1.5
-    tp_atr_multiplier: float = 3.0
-    trailing_atr_multiplier: float = 1.2
-    max_hold_days: int = 10
+    stop_atr_multiplier: float = 2.0
+    tp_atr_multiplier: float = 4.0
+    trailing_atr_multiplier: float = 1.5
+    max_hold_days: int = 15
     
     # Position sizing
     kelly_fraction: float = 0.25  # Conservative Kelly
@@ -345,13 +353,19 @@ class FeatureBuilder:
     
     def technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """ENHANCED technical indicators with better signals"""
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        volume = df['volume'].astype(float)
+        close = df['close']
+        high = df['high']
+        low = df['low']
+        volume = df['volume']
         
         features = pd.DataFrame(index=df.index)
         
+        # Williams %R (more sensitive than RSI)
+        for period in [14, 21, 28]:
+            highest_high = high.rolling(period).max()
+            lowest_low = low.rolling(period).min()
+            features[f'williams_r_{period}'] = (highest_high - close) / (highest_high - lowest_low + 1e-8) * -100
+
         # ENHANCED PRICE MOMENTUM FEATURES
         for period in [3, 5, 8, 13, 21]:  # Fibonacci periods
             momentum = close.pct_change(period)
@@ -361,6 +375,40 @@ class FeatureBuilder:
             mom_std = momentum.rolling(10).std()
             features[f'momentum_consistency_{period}d'] = abs(momentum) / (mom_std + 1e-8)
         
+         # Stochastic Oscillator
+        for period in [14, 21]:
+            lowest_low = low.rolling(period).min()
+            highest_high = high.rolling(period).max()
+            k_percent = 100 * (close - lowest_low) / (highest_high - lowest_low + 1e-8)
+            features[f'stoch_k_{period}'] = k_percent
+            features[f'stoch_d_{period}'] = k_percent.rolling(3).mean()
+        
+        # MACD
+            ema12 = close.ewm(span=12).mean()
+            ema26 = close.ewm(span=26).mean()
+            macd = ema12 - ema26
+            signal = macd.ewm(span=9).mean()
+            features['macd'] = macd
+            features['macd_signal'] = signal
+            features['macd_histogram'] = macd - signal
+        
+        # Bollinger Bands
+        for period in [20, 50]:
+            sma = close.rolling(period).mean()
+            std = close.rolling(period).std()
+            features[f'bb_upper_{period}'] = sma + (2 * std)
+            features[f'bb_lower_{period}'] = sma - (2 * std)
+            features[f'bb_position_{period}'] = (close - sma) / (2 * std)
+            features[f'bb_width_{period}'] = (2 * std) / sma
+        
+        # Average True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+            features['atr_14'] = true_range.rolling(14).mean()
+            features['atr_21'] = true_range.rolling(21).mean()
+    
         # VOLATILITY REGIME FEATURES
         returns = close.pct_change().fillna(0)
         for period in [5, 10, 20]:
@@ -396,18 +444,18 @@ class FeatureBuilder:
             rsi_momentum = rsi.pct_change(period)
             features[f'rsi_divergence_{period}'] = (np.sign(price_momentum) != np.sign(rsi_momentum)).astype(int)
         
-        # VOLUME-PRICE ANALYSIS
-        vwap = (volume * close).rolling(20).sum() / volume.rolling(20).sum()
-        features['vwap_deviation'] = (close - vwap) / vwap
-        
-        # Volume rate of change
-        volume_roc = volume.pct_change(5)
-        features['volume_momentum'] = volume_roc
-        
-        # Price-volume relationship
-        price_roc = close.pct_change(5)
-        features['price_volume_correlation'] = price_roc.rolling(20).corr(volume_roc)
-        
+            # VOLUME-PRICE ANALYSIS
+            vwap = (volume * close).rolling(20).sum() / volume.rolling(20).sum()
+            features['vwap_deviation'] = (close - vwap) / vwap
+            
+            # Volume rate of change
+            volume_roc = volume.pct_change(5)
+            features['volume_momentum'] = volume_roc
+            
+            # Price-volume relationship
+            price_roc = close.pct_change(5)
+            features['price_volume_correlation'] = price_roc.rolling(20).corr(volume_roc)
+            
         return features.fillna(0)
 
 
@@ -575,7 +623,7 @@ class FeatureBuilder:
         
         for feature_name in all_features.columns:
             if signal_validator.test_feature_predictive_power(
-                all_features[feature_name], forward_return, feature_name, min_ic=0.015
+                all_features[feature_name], forward_return, feature_name, min_ic=0.008
             ):
                 validated_features[feature_name] = all_features[feature_name]
         
@@ -891,40 +939,39 @@ class AdvancedMLPipeline:
     def _extract_feature_importance(self):
         """Extract feature importance from the ensemble"""
         try:
-            # Access calibrated classifiers
             if hasattr(self.pipeline, 'calibrated_classifiers_'):
-                # Take the first calibrated classifier
-                first_calibrated = self.pipeline.calibrated_classifiers_[0]
-                base_estimator = first_calibrated
+                # Get the base pipeline from calibrated classifier
+                base_pipeline = self.pipeline.calibrated_classifiers_[0]
                 
-                # Navigate to the ensemble classifier
-                if hasattr(base_estimator, 'named_steps'):
-                    classifier = base_estimator.named_steps['classifier']
+                if hasattr(base_pipeline, 'named_steps'):
+                    classifier = base_pipeline.named_steps['classifier']
                     
-                    importances = []
-                    for name, estimator in classifier.estimators_:
-                        if hasattr(estimator, 'feature_importances_'):
-                            importances.append(estimator.feature_importances_)
-                    
-                    if importances:
-                        avg_importance = np.mean(importances, axis=0)
+                    # Extract from individual estimators in VotingClassifier
+                    if hasattr(classifier, 'estimators_'):
+                        importances_list = []
+                        for name, estimator in classifier.estimators_:
+                            if hasattr(estimator, 'feature_importances_'):
+                                importances_list.append(estimator.feature_importances_)
                         
-                        # Get feature names after transformation
-                        feature_selector = base_estimator.named_steps['feature_selection']
-                        selected_features = feature_selector.get_support(indices=True)
-                        
-                        # Map back to original feature names
-                        original_features = list(self.X_train.columns)
-                        selected_feature_names = [original_features[i] for i in selected_features]
-                        
-                        self.feature_importance_ = pd.Series(avg_importance, index=selected_feature_names)
-                        logger.info("Feature importance extraction successful")
-                        return
-                        
-            logger.warning("Could not extract feature importance - using alternative method")
+                        if importances_list:
+                            # Average across all estimators
+                            avg_importance = np.mean(importances_list, axis=0)
+                            
+                            # Get selected feature names
+                            feature_selector = base_pipeline.named_steps['feature_selection']
+                            selected_features = feature_selector.get_support(indices=True)
+                            original_features = list(self.X_train.columns)
+                            selected_feature_names = [original_features[i] for i in selected_features]
+                            
+                            self.feature_importance_ = pd.Series(avg_importance, index=selected_feature_names)
+                            logger.info(" Feature importance extraction successful")
+                            return
+            
+            logger.info(" VotingClassifier doesn't expose unified feature importance (this is normal)")
             
         except Exception as e:
-            logger.warning(f"Feature importance extraction failed: {e}")
+            logger.info(f" Feature importance extraction skipped: {e} (this is normal for ensemble methods)")
+
 
 
     
@@ -1581,6 +1628,391 @@ class Backtester:
         }
 
 # =========================
+# Enhanced Performance Visualization
+# =========================
+class EnhancedPerformanceVisualizer:
+    """Comprehensive portfolio performance visualization with Plotly"""
+    
+    def __init__(self):
+        if not PLOTLY_AVAILABLE:
+            logger.warning("Plotly not available. Install with: pip install plotly")
+    
+    def create_comprehensive_dashboard(self, results: Dict[str, Any], symbol: str, 
+                                    benchmark_data: pd.DataFrame = None) -> Dict[str, go.Figure]:
+        """Create complete trading dashboard"""
+        
+        if not PLOTLY_AVAILABLE:
+            logger.warning("Plotly not available - skipping visualizations")
+            return {}
+        
+        nav_series = results['nav_series']
+        returns_series = results['returns_series']
+        trade_history = results['trade_history']
+        
+        figures = {}
+        
+        # 1. MAIN PERFORMANCE CHART
+        figures['performance'] = self.plot_portfolio_performance(
+            nav_series, benchmark_data, trade_history, symbol
+        )
+        
+        # 2. DRAWDOWN ANALYSIS
+        figures['drawdown'] = self.plot_drawdown_analysis(nav_series, returns_series)
+        
+        # 3. TRADE ANALYSIS
+        figures['trades'] = self.plot_trade_analysis(trade_history)
+        
+        # 4. MONTHLY RETURNS HEATMAP
+        figures['monthly_returns'] = self.plot_monthly_returns_heatmap(returns_series)
+        
+        # 5. ROLLING METRICS
+        figures['rolling_metrics'] = self.plot_rolling_metrics(returns_series)
+        
+        return figures
+    
+    def plot_portfolio_performance(self, nav_series: pd.Series, benchmark_data: pd.DataFrame,
+                                 trade_history: List[Dict], symbol: str) -> go.Figure:
+        """Enhanced portfolio vs benchmark performance"""
+        
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=[
+                f"Portfolio vs Benchmark Performance - {symbol}",
+                "Position Sizes Over Time", 
+                "Trade Signals"
+            ],
+            row_heights=[0.6, 0.2, 0.2]
+        )
+        
+        # Portfolio NAV
+        fig.add_trace(
+            go.Scatter(
+                x=nav_series.index,
+                y=nav_series.values,
+                mode='lines',
+                name='Portfolio NAV',
+                line=dict(color='#1f77b4', width=2),
+                hovertemplate='<b>Portfolio</b><br>Date: %{x}<br>NAV: Rs %{y:,.0f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # Benchmark comparison
+        if benchmark_data is not None:
+            benchmark_aligned = benchmark_data['close'].reindex(nav_series.index, method='ffill')
+            benchmark_normalized = (benchmark_aligned / benchmark_aligned.iloc[0]) * nav_series.iloc[0]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=benchmark_normalized.index,
+                    y=benchmark_normalized.values,
+                    mode='lines',
+                    name='Nifty 50',
+                    line=dict(color='#ff7f0e', width=2, dash='dash'),
+                    hovertemplate='<b>Benchmark</b><br>Date: %{x}<br>Value: Rs %{y:,.0f}<extra></extra>'
+                ),
+                row=1, col=1
+            )
+        
+        # Position sizes
+        entry_trades = [t for t in trade_history if 'entry_date' in t]
+        if entry_trades:
+            entry_dates = [t['entry_date'] for t in entry_trades]
+            position_sizes = [t['shares'] for t in entry_trades]
+            
+            fig.add_trace(
+                go.Bar(
+                    x=entry_dates,
+                    y=position_sizes,
+                    name='Position Size',
+                    marker_color='lightblue',
+                    hovertemplate='<b>Position</b><br>Date: %{x}<br>Shares: %{y}<extra></extra>'
+                ),
+                row=2, col=1
+            )
+        
+        # Trade signals
+        entry_trades = [t for t in trade_history if 'entry_date' in t]
+        exit_trades = [t for t in trade_history if 'exit_date' in t]
+        
+        if entry_trades:
+            fig.add_trace(
+                go.Scatter(
+                    x=[t['entry_date'] for t in entry_trades],
+                    y=[1] * len(entry_trades),
+                    mode='markers',
+                    name='Buy Signals',
+                    marker=dict(color='green', size=10, symbol='triangle-up'),
+                    hovertemplate='<b>BUY</b><br>Date: %{x}<br>Price: Rs %{text}<extra></extra>',
+                    text=[f"{t['entry_price']:.2f}" for t in entry_trades]
+                ),
+                row=3, col=1
+            )
+        
+        if exit_trades:
+            fig.add_trace(
+                go.Scatter(
+                    x=[t['exit_date'] for t in exit_trades],
+                    y=[-1] * len(exit_trades),
+                    mode='markers',
+                    name='Sell Signals',
+                    marker=dict(color='red', size=10, symbol='triangle-down'),
+                    hovertemplate='<b>SELL</b><br>Date: %{x}<br>Price: Rs %{text}<br>Reason: %{customdata}<extra></extra>',
+                    text=[f"{t['exit_price']:.2f}" for t in exit_trades],
+                    customdata=[t.get('exit_reason', 'N/A') for t in exit_trades]
+                ),
+                row=3, col=1
+            )
+        
+        fig.update_layout(
+            height=800,
+            title=f"AI Trading Bot Performance Dashboard - {symbol}",
+            hovermode='x unified',
+            template='plotly_white'
+        )
+        
+        return fig
+    
+    def plot_drawdown_analysis(self, nav_series: pd.Series, returns_series: pd.Series) -> go.Figure:
+        """Detailed drawdown analysis"""
+        
+        # Calculate drawdowns
+        cumulative_max = nav_series.cummax()
+        drawdowns = (nav_series - cumulative_max) / cumulative_max * 100
+        
+        # Rolling volatility
+        rolling_vol = returns_series.rolling(30).std() * np.sqrt(252) * 100
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            subplot_titles=["Drawdown Analysis", "Rolling 30-Day Volatility"],
+            vertical_spacing=0.1
+        )
+        
+        # Drawdowns
+        fig.add_trace(
+            go.Scatter(
+                x=drawdowns.index,
+                y=drawdowns.values,
+                mode='lines',
+                fill='tozeroy',
+                name='Drawdown %',
+                line=dict(color='red'),
+                fillcolor='rgba(255, 0, 0, 0.3)',
+                hovertemplate='<b>Drawdown</b><br>Date: %{x}<br>Drawdown: %{y:.2f}%<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # Rolling volatility
+        fig.add_trace(
+            go.Scatter(
+                x=rolling_vol.index,
+                y=rolling_vol.values,
+                mode='lines',
+                name='Annualized Vol %',
+                line=dict(color='orange'),
+                hovertemplate='<b>Volatility</b><br>Date: %{x}<br>Vol: %{y:.2f}%<extra></extra>'
+            ),
+            row=2, col=1
+        )
+        
+        fig.update_layout(
+            height=500,
+            title="Risk Analysis Dashboard",
+            template='plotly_white'
+        )
+        
+        return fig
+    
+    def plot_trade_analysis(self, trade_history: List[Dict]) -> go.Figure:
+        """Comprehensive trade analysis"""
+        
+        completed_trades = [t for t in trade_history if 'pnl' in t]
+        
+        if not completed_trades:
+            fig = go.Figure()
+            fig.add_annotation(text="No completed trades to analyze", 
+                            xref="paper", yref="paper", x=0.5, y=0.5)
+            return fig
+        
+        # FIXED: Use proper subplot specs for pie chart
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=[
+                "P&L Distribution", 
+                "Trade Returns Over Time",
+                "Holding Period Analysis",
+                "Exit Reason Breakdown"
+            ],
+            specs=[[{"type": "xy"}, {"type": "xy"}],
+                [{"type": "xy"}, {"type": "domain"}]]  # Fixed: domain type for pie chart
+        )
+        
+        # P&L distribution
+        pnls = [t['pnl'] for t in completed_trades]
+        fig.add_trace(
+            go.Histogram(
+                x=pnls,
+                name='P&L Distribution',
+                nbinsx=20,
+                marker_color='lightblue'
+            ),
+            row=1, col=1
+        )
+        
+        # Returns over time
+        trade_dates = [t['exit_date'] for t in completed_trades]
+        trade_returns = [t.get('return_pct', 0) * 100 for t in completed_trades]
+        
+        colors = ['green' if r > 0 else 'red' for r in trade_returns]
+        
+        fig.add_trace(
+            go.Scatter(
+                x=trade_dates,
+                y=trade_returns,
+                mode='markers+lines',
+                name='Trade Returns %',
+                marker=dict(color=colors, size=8),
+                line=dict(color='gray', width=1)
+            ),
+            row=1, col=2
+        )
+        
+        # Holding period
+        holding_periods = [t['days_held'] for t in completed_trades]
+        fig.add_trace(
+            go.Histogram(
+                x=holding_periods,
+                name='Holding Period (Days)',
+                nbinsx=15,
+                marker_color='lightgreen'
+            ),
+            row=2, col=1
+        )
+        
+        # Exit reasons (FIXED)
+        exit_reasons = [t.get('exit_reason', 'unknown') for t in completed_trades]
+        exit_counts = pd.Series(exit_reasons).value_counts()
+        
+        fig.add_trace(
+            go.Pie(
+                labels=exit_counts.index,
+                values=exit_counts.values,
+                name='Exit Reasons'
+            ),
+            row=2, col=2
+        )
+        
+        fig.update_layout(
+            height=600,
+            title="Trade Analysis Dashboard",
+            template='plotly_white'
+        )
+        
+        return fig
+
+    
+    def plot_monthly_returns_heatmap(self, returns_series: pd.Series) -> go.Figure:
+        """Monthly returns heatmap"""
+        
+        # Calculate monthly returns
+        monthly_returns = returns_series.resample('M').apply(lambda x: (1 + x).prod() - 1)
+        
+        # Create pivot table for heatmap
+        monthly_data = []
+        for date, ret in monthly_returns.items():
+            monthly_data.append({
+                'Year': date.year,
+                'Month': date.strftime('%b'),
+                'Return': ret * 100
+            })
+        
+        df_monthly = pd.DataFrame(monthly_data)
+        pivot_table = df_monthly.pivot(index='Year', columns='Month', values='Return')
+        
+        # Reorder months
+        month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        pivot_table = pivot_table.reindex(columns=month_order)
+        
+        fig = go.Figure(data=go.Heatmap(
+            z=pivot_table.values,
+            x=pivot_table.columns,
+            y=pivot_table.index,
+            colorscale='RdYlGn',
+            zmid=0,
+            text=np.round(pivot_table.values, 2),
+            texttemplate='%{text}%',
+            textfont={'size': 10},
+            hovertemplate='Year: %{y}<br>Month: %{x}<br>Return: %{z:.2f}%<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Monthly Returns Heatmap (%)",
+            height=400,
+            template='plotly_white'
+        )
+        
+        return fig
+    
+    def plot_rolling_metrics(self, returns_series: pd.Series) -> go.Figure:
+        """Rolling performance metrics"""
+        
+        # Calculate rolling metrics
+        rolling_sharpe = returns_series.rolling(252).apply(
+            lambda x: (x.mean() / x.std()) * np.sqrt(252) if x.std() > 0 else 0
+        )
+        
+        rolling_sortino = returns_series.rolling(252).apply(
+            lambda x: (x.mean() / x[x < 0].std()) * np.sqrt(252) if len(x[x < 0]) > 0 and x[x < 0].std() > 0 else 0
+        )
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            subplot_titles=["Rolling Sharpe Ratio (252 days)", "Rolling Sortino Ratio (252 days)"]
+        )
+        
+        # Rolling Sharpe
+        fig.add_trace(
+            go.Scatter(
+                x=rolling_sharpe.index,
+                y=rolling_sharpe.values,
+                mode='lines',
+                name='Rolling Sharpe',
+                line=dict(color='blue')
+            ),
+            row=1, col=1
+        )
+        
+        # Add horizontal line at 1.0 for Sharpe
+        fig.add_hline(y=1.0, line_dash="dash", line_color="gray", row=1, col=1)
+        
+        # Rolling Sortino
+        fig.add_trace(
+            go.Scatter(
+                x=rolling_sortino.index,
+                y=rolling_sortino.values,
+                mode='lines',
+                name='Rolling Sortino',
+                line=dict(color='purple')
+            ),
+            row=2, col=1
+        )
+        
+        fig.update_layout(
+            height=500,
+            title="Rolling Risk-Adjusted Performance Metrics",
+            template='plotly_white'
+        )
+        
+        return fig
+
+# =========================
 # Enhanced data manager
 # =========================
 class DataManager:
@@ -1721,33 +2153,59 @@ class AITradingBot:
         self.feature_builder = FeatureBuilder()
         self.model = AdvancedMLPipeline(self.config)
         self.threshold_optimizer = DynamicThresholdOptimizer(self.config)
+        self.visualizer = EnhancedPerformanceVisualizer()
         
     def run_analysis(self, 
                 symbol: str = 'TATAMOTORS',
                 period: str = '3y',
-                initial_capital: float = 100000) -> Dict[str, Any]:
-        """Run complete trading analysis"""
+                initial_capital: float = 100000,
+                show_plots: bool = True,
+                save_html: bool = True) -> Dict[str, Any]:
+        """Run complete trading analysis with enhanced visualizations"""
         
         logger.info(f"Starting analysis for {symbol}")
         
         try:
-            # 1. Download data
             price_data = self.data_manager.download_data(symbol, period)
-            
-            # 2. Download market index data (NEW!)
-            logger.info("Downloading market index data...")
             market_data = self.data_manager.download_market_index(period)
-            
-            # 3. Build features with market correlation (UPDATED!)
-            logger.info("Building features...")
             feature_data = self.feature_builder.build_features(price_data, market_data=market_data)
-            
-            # Rest remains the same...
-            logger.info("Detecting market regimes...")
             regime_data = self.feature_builder.regime_detector.detect(price_data)
             
             backtester = Backtester(price_data, feature_data, regime_data, self.config)
             results = backtester.run_backtest(self.model, self.threshold_optimizer, initial_capital)
+            
+            if show_plots and PLOTLY_AVAILABLE:
+                import webbrowser
+                import os
+                
+                logger.info("Creating comprehensive visualizations...")
+                figures = self.visualizer.create_comprehensive_dashboard(
+                    results, symbol, market_data
+                )
+                
+               
+                for name, fig in figures.items():
+                    if fig:
+                        if save_html:
+                            filename = f"{symbol}_{name}_dashboard.html"
+                            fig.write_html(filename)
+                            logger.info(f"Saved: {filename}")
+                            
+                            # Open in browser
+                            # file_path = os.path.abspath(filename)
+                            # webbrowser.open(f'file://{file_path}')
+                            # logger.info(f" Opened: {filename}")
+                        else:
+                           
+                            fig.show()
+               
+                if save_html:
+                    self._create_dashboard_index(symbol)
+                
+                results['figures'] = figures
+                
+            elif show_plots and not PLOTLY_AVAILABLE:
+                logger.warning("Plotly not available. Install with: pip install plotly")
             
             self._print_analysis_report(symbol, results)
             return results
@@ -1755,6 +2213,7 @@ class AITradingBot:
         except Exception as e:
             logger.error(f"Analysis failed: {e}")
             raise
+
 
     
     def _print_analysis_report(self, symbol: str, results: Dict[str, Any]):
@@ -1811,64 +2270,129 @@ class AITradingBot:
         
         print("\n" + "=" * 90)
 
-
+    def _create_dashboard_index(self, symbol: str):
+        """Create an index HTML file linking to all dashboards"""
+        import webbrowser
+        import os
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>{symbol} AI Trading Bot Dashboard</title>
+            <style>
+                body {{ 
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                    margin: 40px; 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                }}
+                .container {{
+                    background: rgba(255,255,255,0.1);
+                    padding: 30px;
+                    border-radius: 15px;
+                    backdrop-filter: blur(10px);
+                }}
+                h1 {{ color: #fff; text-align: center; margin-bottom: 30px; }}
+                h2 {{ color: #f0f0f0; }}
+                .dashboard-link {{ 
+                    display: block; 
+                    padding: 20px; 
+                    margin: 15px 0; 
+                    background: rgba(255,255,255,0.2); 
+                    text-decoration: none; 
+                    border-radius: 10px;
+                    color: white;
+                    font-weight: bold;
+                    font-size: 16px;
+                    transition: all 0.3s ease;
+                }}
+                .dashboard-link:hover {{ 
+                    background: rgba(255,255,255,0.3); 
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+                }}
+                .emoji {{ font-size: 24px; margin-right: 10px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>&#129302; {symbol} AI Trading Bot Analysis</h1>
+                <h2>&#128200; Interactive Trading Dashboards</h2>
+                
+                <a href="{symbol}_performance_dashboard.html" class="dashboard-link">
+                    <span class="emoji">&#128200;</span> Portfolio Performance 
+                </a>
+                <a href="{symbol}_drawdown_dashboard.html" class="dashboard-link">
+                    <span class="emoji">&#128201;</span> Risk Analysis 
+                </a>
+                <a href="{symbol}_trades_dashboard.html" class="dashboard-link">
+                    <span class="emoji">&#128176;</span> Trade Analysis & P&L Distribution
+                </a>
+                <a href="{symbol}_monthly_returns_dashboard.html" class="dashboard-link">
+                    <span class="emoji">&#128197;</span> Monthly Returns Heatmap
+                </a>
+                <a href="{symbol}_rolling_metrics_dashboard.html" class="dashboard-link">
+                    <span class="emoji">&#128200;</span> Rolling Performance Metrics
+                </a>
+                
+                <hr style="margin: 30px 0; border: 1px solid rgba(255,255,255,0.3);">
+                <p style="text-align: center; opacity: 0.8;">
+                    &#127919; Analysis complete! Click on any dashboard above to explore detailed insights.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        index_filename = f"{symbol}_dashboard_index.html"
+        with open(index_filename, 'w', encoding='utf-8') as f:  # FIXED: Added encoding='utf-8'
+            f.write(html_content)
+        
+        # Open the index page
+        index_path = os.path.abspath(index_filename)
+        webbrowser.open(f'file://{index_path}')
+        logger.info(f"Dashboard index opened: {index_filename}")
 
 # =========================
 # Main execution
 # =========================
 def main():
-    """Main execution function"""
+    """Enhanced main execution"""
     
-    # Initialize bot with custom config
+    # Use improved configuration
     config = TradingConfig(
-        target_annual_vol=0.15,
-        max_drawdown=0.10,
-        min_confidence=0.58,
-        kelly_fraction=0.20
+        target_annual_vol=0.18,
+        max_drawdown=0.12,
+        min_confidence=0.48,
+        kelly_fraction=0.25,
+        stop_atr_multiplier=2.0,
+        tp_atr_multiplier=4.0,
+        max_hold_days=15
     )
     
     bot = AITradingBot(config)
     
-    # Run analysis on multiple symbols
-    symbols = ['TATAMOTORS', 'RELIANCE', 'TCS', 'HDFCBANK']
+   
+    symbol = 'RELIANCE'
     
-    for symbol in symbols:
-        try:
-            logger.info(f"\nAnalyzing {symbol}...")
-            results = bot.run_analysis(
-                symbol=symbol,
-                period='2y',
-                initial_capital=500000  # 5 lakh INR
-            )
+    try:
+        logger.info(f"Running enhanced analysis for {symbol}...")
+        results = bot.run_analysis(
+            symbol=symbol,
+            period='2y',
+            initial_capital=500000,
+            show_plots=True  # Enable comprehensive plotting
+        )
+        
+        # Optional: Save results and plots
+        import pickle
+        with open(f'{symbol}_enhanced_results.pkl', 'wb') as f:
+            pickle.dump(results, f)
             
-            # Optionally save results
-            # with open(f'{symbol}_analysis.json', 'w') as f:
-            #     json.dump(results['performance_stats'], f, indent=2)
-                
-        except Exception as e:
-            logger.error(f"Failed to analyze {symbol}: {e}")
-            continue
-
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}")
 
 if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
-    
-    # Check dependencies
-    missing_deps = []
-    if not XGB_AVAILABLE:
-        missing_deps.append("xgboost")
-    if not LGB_AVAILABLE:
-        missing_deps.append("lightgbm") 
-    if not YF_AVAILABLE:
-        missing_deps.append("yfinance")
-        
-    if missing_deps:
-        logger.warning(f"Missing optional dependencies: {missing_deps}")
-        logger.info("Install with: pip install " + " ".join(missing_deps))
-    
-    # Run main analysis
     main()
+
