@@ -411,49 +411,6 @@ class FeatureBuilder:
         return features.fillna(0)
 
 
-class SignalValidator:
-    """Test individual features for predictive power before using them"""
-    
-    def __init__(self):
-        self.feature_scores = {}
-        self.validated_features = []
-    
-    def test_feature_predictive_power(self, feature_series: pd.Series, targets: pd.Series, 
-                                    feature_name: str, min_ic: float = 0.02) -> bool:
-        """Test if a feature has predictive power using Information Coefficient"""
-        try:
-            from scipy.stats import spearmanr
-            
-            # Remove NaN values
-            valid_idx = ~(feature_series.isna() | targets.isna())
-            if valid_idx.sum() < 50:
-                return False
-            
-            clean_feature = feature_series[valid_idx]
-            clean_targets = targets[valid_idx]
-            
-            # Calculate Information Coefficient (Spearman correlation)
-            ic, p_value = spearmanr(clean_feature, clean_targets)
-            
-            # Feature is valid if it shows predictive power
-            is_valid = abs(ic) > min_ic and p_value < 0.1
-            
-            self.feature_scores[feature_name] = {
-                'information_coefficient': ic,
-                'p_value': p_value,
-                'is_valid': is_valid
-            }
-            
-            if is_valid:
-                self.validated_features.append(feature_name)
-                logger.info(f"✅ Feature '{feature_name}' validated: IC={ic:.4f}, p={p_value:.4f}")
-            
-            return is_valid
-            
-        except Exception as e:
-            logger.warning(f"Error validating feature {feature_name}: {e}")
-            return False
-
     def market_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """ADVANCED market microstructure signals"""
         features = pd.DataFrame(index=df.index)
@@ -745,7 +702,49 @@ class SignalValidator:
         
         return targets
 
-
+class SignalValidator:
+    """Test individual features for predictive power before using them"""
+    
+    def __init__(self):
+        self.feature_scores = {}
+        self.validated_features = []
+    
+    def test_feature_predictive_power(self, feature_series: pd.Series, targets: pd.Series, 
+                                    feature_name: str, min_ic: float = 0.02) -> bool:
+        """Test if a feature has predictive power using Information Coefficient"""
+        try:
+            from scipy.stats import spearmanr
+            
+            # Remove NaN values
+            valid_idx = ~(feature_series.isna() | targets.isna())
+            if valid_idx.sum() < 50:
+                return False
+            
+            clean_feature = feature_series[valid_idx]
+            clean_targets = targets[valid_idx]
+            
+            # Calculate Information Coefficient (Spearman correlation)
+            ic, p_value = spearmanr(clean_feature, clean_targets)
+            
+            # Feature is valid if it shows predictive power
+            is_valid = abs(ic) > min_ic and p_value < 0.1
+            
+            self.feature_scores[feature_name] = {
+                'information_coefficient': ic,
+                'p_value': p_value,
+                'is_valid': is_valid
+            }
+            
+            if is_valid:
+                self.validated_features.append(feature_name)
+                logger.info(f"✅ Feature '{feature_name}' validated: IC={ic:.4f}, p={p_value:.4f}")
+            
+            return is_valid
+            
+        except Exception as e:
+            logger.warning(f"Error validating feature {feature_name}: {e}")
+            return False
+        
 # =========================
 # Advanced ML Pipeline
 # =========================
@@ -1766,31 +1765,31 @@ class AITradingBot:
         model_metrics = results.get('model_metrics', {})
         
         print("\n" + "=" * 90)
-        print(f"🎯 ENHANCED AI TRADING BOT ANALYSIS - {symbol}")
+        print(f" ENHANCED AI TRADING BOT ANALYSIS - {symbol}")
         print("=" * 90)
         
         # SIGNAL QUALITY ASSESSMENT
         auc = model_metrics.get('auc', 0)
         accuracy = model_metrics.get('accuracy', 0)
         
-        print(f"\n🧪 SIGNAL QUALITY ASSESSMENT:")
+        print(f"\n SIGNAL QUALITY ASSESSMENT:")
         print(f"  Model AUC:        {auc:.3f}")
         print(f"  Model Accuracy:   {accuracy:.3f}")
         
         if auc > 0.55:
-            print(f"  ✅ SIGNAL STRENGTH: STRONG - Good predictive power")
+            print(f"   SIGNAL STRENGTH: STRONG - Good predictive power")
         elif auc > 0.52:
-            print(f"  🟡 SIGNAL STRENGTH: MODERATE - Some predictive power") 
+            print(f"   SIGNAL STRENGTH: MODERATE - Some predictive power") 
         else:
-            print(f"  ❌ SIGNAL STRENGTH: WEAK - Poor predictive signals")
-            print(f"  💡 RECOMMENDATION: Need better feature engineering")
+            print(f"   SIGNAL STRENGTH: WEAK - Poor predictive signals")
+            print(f"   RECOMMENDATION: Need better feature engineering")
         
         # Enhanced performance metrics
         sharpe = stats.get('sharpe_ratio', 0)
         num_trades = stats.get('num_trades', 0)
         win_rate = stats.get('win_rate', 0)
         
-        print(f"\n📊 STRATEGY PERFORMANCE:")
+        print(f"\n STRATEGY PERFORMANCE:")
         print(f"  Total Return:     {stats.get('total_return', 0):.2%}")
         print(f"  Sharpe Ratio:     {sharpe:.3f}")
         print(f"  Win Rate:         {win_rate:.1%}")
@@ -1798,15 +1797,15 @@ class AITradingBot:
         print(f"  Max Drawdown:     {stats.get('max_drawdown', 0):.2%}")
         
         # Overall assessment
-        print(f"\n🎯 OVERALL ASSESSMENT:")
+        print(f"\n OVERALL ASSESSMENT:")
         if auc > 0.55 and sharpe > 1.0:
-            print(f"🎉 EXCELLENT: Strong signals + great returns")
+            print(f" EXCELLENT: Strong signals + great returns")
         elif auc > 0.52 and sharpe > 0.5:
-            print(f"✅ GOOD: Decent signals + positive returns")
+            print(f" GOOD: Decent signals + positive returns")
         elif auc > 0.52:
-            print(f"🟡 PROMISING: Good signals but execution needs work")
+            print(f"PROMISING: Good signals but execution needs work")
         else:
-            print(f"⚠️  NEEDS MAJOR IMPROVEMENT:")
+            print(f"  NEEDS MAJOR IMPROVEMENT:")
             print(f"     - Feature engineering is insufficient")
             print(f"     - Model cannot distinguish profitable patterns")
             print(f"     - Consider alternative data sources")
