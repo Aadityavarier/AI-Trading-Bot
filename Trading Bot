@@ -394,7 +394,7 @@ class FeatureBuilder:
             # RSI divergence proxy
             price_momentum = close.pct_change(period)
             rsi_momentum = rsi.pct_change(period)
-            features[f'rsi_divergence_{period}'] = np.sign(price_momentum) != np.sign(rsi_momentum)
+            features[f'rsi_divergence_{period}'] = (np.sign(price_momentum) != np.sign(rsi_momentum)).astype(int)
         
         # VOLUME-PRICE ANALYSIS
         vwap = (volume * close).rolling(20).sum() / volume.rolling(20).sum()
@@ -570,7 +570,7 @@ class FeatureBuilder:
         forward_return = (close_next - open_next) / open_next
         
         # VALIDATE FEATURES INDIVIDUALLY
-        logger.info("🧪 Starting individual feature validation...")
+        logger.info(" Starting individual feature validation...")
         validated_features = pd.DataFrame(index=df.index)
         
         for feature_name in all_features.columns:
@@ -580,13 +580,13 @@ class FeatureBuilder:
                 validated_features[feature_name] = all_features[feature_name]
         
         if len(validated_features.columns) == 0:
-            logger.warning("⚠️ No features passed validation, using top 20 by correlation")
+            logger.warning(" No features passed validation, using top 20 by correlation")
             # Fallback: use top features by absolute correlation
             correlations = all_features.corrwith(forward_return).abs().sort_values(ascending=False)
             top_features = correlations.head(20).index
             validated_features = all_features[top_features]
         else:
-            logger.info(f"✅ {len(validated_features.columns)} features passed validation")
+            logger.info(f" {len(validated_features.columns)} features passed validation")
         
         # Add targets
         validated_features['target_return'] = forward_return
@@ -737,7 +737,7 @@ class SignalValidator:
             
             if is_valid:
                 self.validated_features.append(feature_name)
-                logger.info(f"✅ Feature '{feature_name}' validated: IC={ic:.4f}, p={p_value:.4f}")
+                logger.info(f" Feature '{feature_name}' validated: IC={ic:.4f}, p={p_value:.4f}")
             
             return is_valid
             
@@ -799,8 +799,7 @@ class AdvancedMLPipeline:
                 reg_lambda=0.5,     # L2 regularization
                 scale_pos_weight=1.0,
                 random_state=42,
-                eval_metric='logloss',
-                early_stopping_rounds=50
+                eval_metric='logloss'
             )
             models.append(('xgb', xgb_model))
         
