@@ -60,18 +60,15 @@ The AI Trading Bot is a state-of-the-art, institution-grade algorithmic trading 
 
 ```plaintext
 AI-Trading-Bot/
-├── main.py
-├── config/
-│   └── TradingConfig.yaml
-├── features/
-│   └── FeatureBuilder.py
-├── models/
-│   └── MLModels.py
+├── Trading_Bot
 ├── reports/
-│   └── [timestamped analysis reports]
+│   └── [visual analysis reports]
+├── .github/
+│   └── workflows/
+|       └──python-ci.yml
 ├── requirements.txt
 ├── readme.md
-└── ...
+└── license
 ```
 
 ---
