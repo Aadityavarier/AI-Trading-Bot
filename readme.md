@@ -178,8 +178,6 @@ Contributions, bug reports, and feature requests are welcome!
 4. Push to the branch (`git push origin feature/fooBar`).
 5. Open a Pull Request.
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
 ---
 
 ## License
