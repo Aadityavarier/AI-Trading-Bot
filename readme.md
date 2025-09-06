@@ -91,7 +91,7 @@ pip install -r requirements.txt
 
 Adjust trading parameters, risk tolerance, target volatility, etc. in the config file.
 
-**Example (config/TradingConfig.yaml):**
+**Default:**
 ```yaml
 risk_tolerance: 0.02
 target_volatility: 0.15
