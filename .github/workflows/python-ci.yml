@@ -24,8 +24,9 @@ jobs:
         pip install -r requirements.txt
 
     - name: Run Trading Bot
-      run: |
-        python Trading_bot
+      working-directory: ./AI-Trading-Bot
+      run: python Trading_bot.py
+
 
     - name: Upload reports
       if: success()
