@@ -184,7 +184,7 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
-This project is licensed under the MIT License. See the [License](License) file for details.
+This project is licensed under the MIT License. See the [license](license) file for details.
 
 ---
 
