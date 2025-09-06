@@ -25,7 +25,7 @@ jobs:
 
     - name: Run Trading Bot
       run: |
-        python Trading_bot.py
+        python Trading_bot
 
     - name: Upload reports
       if: success()
