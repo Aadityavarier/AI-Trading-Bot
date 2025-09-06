@@ -61,7 +61,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Ai_AI_Trading_Bot")
+logger = logging.getLogger("AI_Trading_Bot")
 
 # =========================
 # Configuration
@@ -71,26 +71,26 @@ class TradingConfig:
     # Risk parameters
     target_annual_vol: float = 0.18
     max_drawdown: float = 0.12
-    max_position_pct: float = 0.20
-    min_confidence: float = 0.48
+    max_position_pct: float = 0.40
+    min_confidence: float = 0.58
     
     # Stop loss / Take profit
-    stop_atr_multiplier: float = 2.0
-    tp_atr_multiplier: float = 4.0
+    stop_atr_multiplier: float = 3.0
+    tp_atr_multiplier: float = 5.0
     trailing_atr_multiplier: float = 1.5
-    max_hold_days: int = 15
+    max_hold_days: int = 35
     
     # Position sizing
-    kelly_fraction: float = 0.25  # Conservative Kelly
+    kelly_fraction: float = 0.6  
     vol_lookback: int = 60
     
-    # Cost parameters (India)
+    # Cost parameters 
     brokerage_bps: float = 5.0
     stt_bps: float = 10.0
     impact_coefficient: float = 0.1
 
 # =========================
-# Fast utilities (Numba optimized)
+# Fast utilities 
 # =========================
 @nb.njit(cache=True)
 def fast_rolling_mean(a: np.ndarray, w: int) -> np.ndarray:
@@ -229,14 +229,14 @@ def safe_divide(numerator: pd.Series, denominator: pd.Series, default_val: float
         result = result.replace([np.inf, -np.inf], default_val)
         
         # Cap extreme values
-        result = result.clip(-1000, 1000)  # Reasonable bounds
+        result = result.clip(-1000, 1000)  
         
         return result.fillna(default_val)
     
 # =========================
-# Enhanced regime detection
+# Regime detection
 # =========================
-class AdvancedRegimeDetector:
+class RegimeDetector:
     """Multi-dimensional regime detection using volatility, trend, and momentum"""
     
     def __init__(self):
@@ -252,8 +252,8 @@ class AdvancedRegimeDetector:
         
         # Regime classification: 0=normal, 1=high vol, -1=low vol
         regime = pd.Series(0, index=returns.index)
-        regime[vol_ratio > 1.5] = 1  # High volatility
-        regime[vol_ratio < 0.7] = -1  # Low volatility
+        regime[vol_ratio > 1.5] = 1  
+        regime[vol_ratio < 0.7] = -1  
         
         return regime.fillna(0)
     
@@ -283,8 +283,8 @@ class AdvancedRegimeDetector:
         mom_vol = mom_score.rolling(20).std()
         
         regime = pd.Series(0, index=prices.index)
-        regime[mom_score > mom_vol] = 1    # Strong momentum
-        regime[mom_score < -mom_vol] = -1   # Negative momentum
+        regime[mom_score > mom_vol] = 1    
+        regime[mom_score < -mom_vol] = -1   
         
         return regime.fillna(0)
     
@@ -329,15 +329,12 @@ class AdvancedRegimeDetector:
     
     def allow_trade(self, regime_row: pd.Series) -> bool:
         """Determine if trading is allowed based on regime"""
-        # Block trades during high stress
         if regime_row.get('stress_regime', 0) == 1:
             return False
         
-        # Block in extreme negative regimes
         if regime_row.get('regime_score', 0) < -1.5:
             return False
             
-        # Block in extreme high volatility with negative trend
         if (regime_row.get('vol_regime', 0) == 1 and 
             regime_row.get('trend_regime', 0) == -1):
             return False
@@ -348,13 +345,13 @@ class AdvancedRegimeDetector:
 # Feature engineering
 # =========================
 class FeatureBuilder:
-    """Advanced feature engineering with multi-timeframe analysis"""
+    """Feature engineering with multi-timeframe analysis"""
     
     def __init__(self):
-        self.regime_detector = AdvancedRegimeDetector()
+        self.regime_detector = RegimeDetector()
     
     def technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """ENHANCED technical indicators with better signals"""
+        """Technical Indicators with multi-timeframe analysis"""
         close = df['close']
         high = df['high']
         low = df['low']
@@ -362,13 +359,13 @@ class FeatureBuilder:
         
         features = pd.DataFrame(index=df.index)
         
-        # Williams %R (more sensitive than RSI)
+        # Williams %R
         for period in [14, 21, 28]:
             highest_high = high.rolling(period).max()
             lowest_low = low.rolling(period).min()
             features[f'williams_r_{period}'] = (highest_high - close) / (highest_high - lowest_low + 1e-8) * -100
 
-        # ENHANCED PRICE MOMENTUM FEATURES
+        # PRICE MOMENTUM FEATURES
         for period in [3, 5, 8, 13, 21]:  # Fibonacci periods
             momentum = close.pct_change(period)
             features[f'momentum_{period}d'] = momentum
@@ -433,7 +430,7 @@ class FeatureBuilder:
             features[f'distance_from_high_{period}d'] = (high_period - close) / close
             features[f'distance_from_low_{period}d'] = (close - low_period) / close
         
-        # ENHANCED RSI WITH MULTIPLE PERIODS
+        # RSI WITH MULTIPLE PERIODS
         for period in [7, 14, 21]:
             rsi = pd.Series(fast_rsi(close.values, period), index=close.index)
             features[f'rsi_{period}'] = rsi
@@ -462,7 +459,7 @@ class FeatureBuilder:
 
 
     def market_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """ADVANCED market microstructure signals"""
+        """Market microstructure signals"""
         features = pd.DataFrame(index=df.index)
         
         open_price = df['open']
@@ -483,11 +480,11 @@ class FeatureBuilder:
         intraday_weight = abs(intraday_return) / (abs(intraday_return) + abs(overnight_return) + 1e-8)
         features['intraday_weight'] = intraday_weight
         
-        # GAP ANALYSIS (ENHANCED)
+        # GAP ANALYSIS 
         gap_size = (open_price - close.shift(1)) / close.shift(1)
         features['gap_size'] = gap_size
         
-        # Gap follow-through (does gap get filled?)
+        # Gap follow-through 
         gap_up_mask = gap_size > 0.005
         gap_down_mask = gap_size < -0.005
         
@@ -505,7 +502,7 @@ class FeatureBuilder:
         features['volume_weighted_return'] = (total_return * volume_weight).rolling(20).sum()
         
         # REVERSAL PATTERNS
-        # Hammer/Doji detection (improved)
+        # Hammer/Doji detection 
         body_size = abs(close - open_price)
         total_range = high - low + 1e-8
         upper_shadow = high - np.maximum(close, open_price)
@@ -519,7 +516,7 @@ class FeatureBuilder:
         features['hammer_signal'] = (
             (features['body_ratio'] < 0.3) & 
             (features['lower_shadow_ratio'] > 0.6) &
-            (close.pct_change() < -0.01)  # After decline
+            (close.pct_change() < -0.01)  
         ).astype(int)
         
         return features.fillna(0)
@@ -560,7 +557,7 @@ class FeatureBuilder:
                 nifty = yf.download("^NSEI", period="2y")['Close']
                 nifty_returns = nifty.pct_change()
             except:
-                nifty_returns = returns  # Fallback to stock returns
+                nifty_returns = returns 
         else:
             nifty_returns = market_data['close'].pct_change()
         
@@ -589,12 +586,10 @@ class FeatureBuilder:
         return features.fillna(0)
 
     def build_features(self, df: pd.DataFrame, horizon: int = 1, market_data: pd.DataFrame = None) -> pd.DataFrame:
-        """ENHANCED feature building with validation"""
+        """Feature building with validation"""
         
-        # Add signal validator
         signal_validator = SignalValidator()
         
-        # Build all features (existing code)
         tech_features = self.technical_indicators(df)
         micro_features = self.market_microstructure_features(df)
         cross_features = self.cross_asset_features(df)
@@ -609,40 +604,34 @@ class FeatureBuilder:
             all_features = pd.concat([tech_features, micro_features, cross_features,
                                     time_features, market_corr_features], axis=1)
         
-        # Get regime features
         regime_features = self.regime_detector.detect(df)
         all_features = pd.concat([all_features, regime_features], axis=1)
         
-        # CREATE TARGETS FIRST
         close = df['close']
         open_next = df['open'].shift(-horizon)
         close_next = df['close'].shift(-horizon)
         forward_return = (close_next - open_next) / open_next
         
-        # VALIDATE FEATURES INDIVIDUALLY
         logger.info(" Starting individual feature validation...")
         validated_features = pd.DataFrame(index=df.index)
         
         for feature_name in all_features.columns:
             if signal_validator.test_feature_predictive_power(
-                all_features[feature_name], forward_return, feature_name, min_ic=0.008
+                all_features[feature_name], forward_return, feature_name, min_ic=0.01
             ):
                 validated_features[feature_name] = all_features[feature_name]
         
         if len(validated_features.columns) == 0:
             logger.warning(" No features passed validation, using top 20 by correlation")
-            # Fallback: use top features by absolute correlation
             correlations = all_features.corrwith(forward_return).abs().sort_values(ascending=False)
             top_features = correlations.head(20).index
             validated_features = all_features[top_features]
         else:
             logger.info(f" {len(validated_features.columns)} features passed validation")
         
-        # Add targets
         validated_features['target_return'] = forward_return
         validated_features['target_direction'] = (forward_return > 0).astype(int)
         
-        # Clean and return
         return self._clean_features(validated_features)
 
 
@@ -651,42 +640,33 @@ class FeatureBuilder:
         """Clean features to remove infinities and extreme values"""
         logger.info("Cleaning features for ML compatibility...")
         
-        # Ensure all features are numeric
         for col in features.columns:
             features[col] = pd.to_numeric(features[col], errors='coerce')
         
-        # Replace infinities with NaN
         features = features.replace([np.inf, -np.inf], np.nan)
         
-        # Fill NaN values with appropriate defaults
         for col in features.columns:
             if col in ['target_return', 'target_direction']:
-                # Don't modify target variables
                 continue
                 
-            # Fill NaN with median (more robust than mean for outliers)
             if features[col].isna().any():
                 median_val = features[col].median()
-                if pd.isna(median_val):  # If all values are NaN
+                if pd.isna(median_val):  
                     median_val = 0.0
                 features[col] = features[col].fillna(median_val)
         
-        # Cap extreme values (winsorization)
         for col in features.columns:
             if col in ['target_return', 'target_direction']:
                 continue
                 
-            # Cap at 99.5th and 0.5th percentiles
             upper_cap = features[col].quantile(0.995)
             lower_cap = features[col].quantile(0.005)
             
             if not pd.isna(upper_cap) and not pd.isna(lower_cap):
                 features[col] = features[col].clip(lower=lower_cap, upper=upper_cap)
         
-        # Final check: remove any remaining problematic values
-        features = features.select_dtypes(include=[np.number])  # Keep only numeric columns
+        features = features.select_dtypes(include=[np.number])  
         
-        # Remove any remaining rows with NaN in targets
         features = features.dropna(subset=['target_return', 'target_direction'])
         
         logger.info(f"Feature cleaning complete. Shape: {features.shape}")
@@ -696,7 +676,7 @@ class FeatureBuilder:
         """Add time-based cyclical features"""
         features = pd.DataFrame(index=df.index)
         
-        # Day of week effects (Indian markets)
+        # Day of week effects 
         features['day_of_week'] = df.index.dayofweek
         features['is_monday'] = (df.index.dayofweek == 0).astype(int)
         features['is_friday'] = (df.index.dayofweek == 4).astype(int)
@@ -706,7 +686,6 @@ class FeatureBuilder:
         features['is_march'] = (df.index.month == 3).astype(int)  # Financial year end
         features['is_october'] = (df.index.month == 10).astype(int)  # Festive season
         
-        # Cyclical encoding for smooth transitions
         features['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
         features['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
         features['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
@@ -721,7 +700,7 @@ class FeatureBuilder:
         
         targets = pd.DataFrame(index=df.index)
         
-        # 1-day target (existing)
+        # 1-day target 
         open_next1 = open_price.shift(-1)
         close_next1 = close.shift(-1)
         ret_1d = (close_next1 - open_next1) / open_next1
@@ -752,6 +731,21 @@ class FeatureBuilder:
         
         return targets
 
+    def add_multi_timeframe_confirmation(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add multi-timeframe trend confirmation"""
+        close = df['close']
+        features = pd.DataFrame(index=df.index)
+        
+        sma_5 = close.rolling(5).mean()
+        sma_20 = close.rolling(20).mean()
+        sma_50 = close.rolling(50).mean()
+        
+        bullish_alignment = (close > sma_5) & (sma_5 > sma_20) & (sma_20 > sma_50)
+        bearish_alignment = (close < sma_5) & (sma_5 < sma_20) & (sma_20 < sma_50)
+        
+        features['trend_alignment'] = bullish_alignment.astype(int) - bearish_alignment.astype(int)
+        return features
+
 class SignalValidator:
     """Test individual features for predictive power before using them"""
     
@@ -765,7 +759,6 @@ class SignalValidator:
         try:
             from scipy.stats import spearmanr
             
-            # Remove NaN values
             valid_idx = ~(feature_series.isna() | targets.isna())
             if valid_idx.sum() < 50:
                 return False
@@ -773,10 +766,8 @@ class SignalValidator:
             clean_feature = feature_series[valid_idx]
             clean_targets = targets[valid_idx]
             
-            # Calculate Information Coefficient (Spearman correlation)
             ic, p_value = spearmanr(clean_feature, clean_targets)
             
-            # Feature is valid if it shows predictive power
             is_valid = abs(ic) > min_ic and p_value < 0.1
             
             self.feature_scores[feature_name] = {
@@ -796,10 +787,10 @@ class SignalValidator:
             return False
         
 # =========================
-# Advanced ML Pipeline
+# ML Pipeline
 # =========================
-class AdvancedMLPipeline:
-    """Enhanced ML pipeline with ensemble methods and proper validation"""
+class MLPipeline:
+    """ ML pipeline with ensemble methods """
     
     def __init__(self, config: TradingConfig):
         self.config = config
@@ -811,20 +802,19 @@ class AdvancedMLPipeline:
         """Create ensemble focused on SIGNAL QUALITY"""
         models = []
         
-        # Random Forest with better parameters for financial data
         rf = RandomForestClassifier(
-            n_estimators=500,  # More trees
-            max_depth=8,       # Deeper trees
-            min_samples_split=20,  # Prevent overfitting
-            min_samples_leaf=10,   # Prevent overfitting  
-            max_features='sqrt',   # Feature randomness
-            class_weight='balanced_subsample',  # Handle imbalance
+            n_estimators=500,  
+            max_depth=8,       
+            min_samples_split=20,  
+            min_samples_leaf=10,    
+            max_features='sqrt',   
+            class_weight='balanced_subsample',  
             bootstrap=True,
             random_state=42
         )
         models.append(('rf', rf))
         
-        # Extra Trees (more randomness)
+        
         from sklearn.ensemble import ExtraTreesClassifier
         et = ExtraTreesClassifier(
             n_estimators=500,
@@ -837,16 +827,16 @@ class AdvancedMLPipeline:
         )
         models.append(('et', et))
         
-        # XGBoost with financial-tuned parameters
+        # XGBoost 
         if XGB_AVAILABLE:
             xgb_model = xgb.XGBClassifier(
                 n_estimators=500,
-                learning_rate=0.01,  # Slower learning
+                learning_rate=0.01,  
                 max_depth=6,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                reg_alpha=0.3,      # L1 regularization
-                reg_lambda=0.5,     # L2 regularization
+                reg_alpha=0.3,     
+                reg_lambda=0.5,     
                 scale_pos_weight=1.0,
                 random_state=42,
                 eval_metric='logloss'
@@ -862,7 +852,7 @@ class AdvancedMLPipeline:
             ('variance_threshold', VarianceThreshold(threshold=1e-6)),
             ('feature_selection', SelectKBest(
                 score_func=mutual_info_classif, 
-                k=min(30, int(self.n_features_ * 0.6))  # Adaptive feature selection
+                k=min(30, int(self.n_features_ * 0.6))  
             )),
             ('scaler', QuantileTransformer(
                 output_distribution='uniform',
@@ -877,30 +867,23 @@ class AdvancedMLPipeline:
     def fit(self, X: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> Dict[str, float]:
         """Fit pipeline with time series cross-validation"""
         self.n_features_ = X.shape[1]
-        self.X_train = X.copy()  # Store training data for feature importance
-        
-        # Create pipeline
+        self.X_train = X.copy()  
         base_pipeline = self.create_pipeline()
         
-        # Time series split for proper validation
         tscv = TimeSeriesSplit(n_splits=n_splits)
         
-        # Calibrated classifier for better probability estimates
         calibrated_clf = CalibratedClassifierCV(
             estimator=base_pipeline,
             method='isotonic',
             cv=tscv
         )
         
-        # Fit calibrated classifier
         logger.info("Fitting calibrated ensemble model...")
         calibrated_clf.fit(X, y)
         self.pipeline = calibrated_clf
         
-        # Evaluate performance on last fold
         last_metrics = self._evaluate_last_fold(X, y, tscv)
         
-        # Extract feature importance if possible
         try:
             self._extract_feature_importance()
         except Exception as e:
@@ -919,7 +902,6 @@ class AdvancedMLPipeline:
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         
-        # Create and fit model on training set
         temp_pipeline = self.create_pipeline()
         temp_pipeline.fit(X_train, y_train)
         
@@ -942,13 +924,11 @@ class AdvancedMLPipeline:
         """Extract feature importance from the ensemble"""
         try:
             if hasattr(self.pipeline, 'calibrated_classifiers_'):
-                # Get the base pipeline from calibrated classifier
                 base_pipeline = self.pipeline.calibrated_classifiers_[0]
                 
                 if hasattr(base_pipeline, 'named_steps'):
                     classifier = base_pipeline.named_steps['classifier']
                     
-                    # Extract from individual estimators in VotingClassifier
                     if hasattr(classifier, 'estimators_'):
                         importances_list = []
                         for name, estimator in classifier.estimators_:
@@ -956,10 +936,8 @@ class AdvancedMLPipeline:
                                 importances_list.append(estimator.feature_importances_)
                         
                         if importances_list:
-                            # Average across all estimators
                             avg_importance = np.mean(importances_list, axis=0)
                             
-                            # Get selected feature names
                             feature_selector = base_pipeline.named_steps['feature_selection']
                             selected_features = feature_selector.get_support(indices=True)
                             original_features = list(self.X_train.columns)
@@ -986,11 +964,11 @@ class AdvancedMLPipeline:
     def get_feature_importance(self) -> Optional[pd.Series]:
         """Get feature importance if available"""
         return self.feature_importance_
-    def create_enhanced_ensemble(self) -> VotingClassifier:
-        """Create enhanced ensemble with more diverse models"""
+    def create_ensemble(self) -> VotingClassifier:
+        """Create ensemble with diverse models"""
         models = []
         
-        # More aggressive Gradient Boosting
+        # Gradient Boosting
         gb = GradientBoostingClassifier(
             n_estimators=300,
             learning_rate=0.03,
@@ -1001,7 +979,7 @@ class AdvancedMLPipeline:
         )
         models.append(('gb', gb))
         
-        # Balanced Random Forest
+        # Random Forest
         rf = RandomForestClassifier(
             n_estimators=300,
             max_depth=8,
@@ -1012,7 +990,7 @@ class AdvancedMLPipeline:
         )
         models.append(('rf', rf))
         
-        # XGBoost with better parameters
+        # XGBoost 
         if XGB_AVAILABLE:
             xgb_model = xgb.XGBClassifier(
                 n_estimators=300,
@@ -1022,7 +1000,7 @@ class AdvancedMLPipeline:
                 colsample_bytree=0.7,
                 reg_alpha=0.2,
                 reg_lambda=1.5,
-                scale_pos_weight=1.2,  # Handle class imbalance
+                scale_pos_weight=1.2,  
                 random_state=42,
                 eval_metric='logloss'
             )
@@ -1055,27 +1033,25 @@ class DynamicThresholdOptimizer:
         
         regime_thresholds = {}
         
-        # Create regime codes
         regime_codes = regimes.apply(lambda row: self._create_regime_code(row), axis=1)
         unique_regimes = regime_codes.unique()
         
         for regime in unique_regimes:
             mask = regime_codes == regime
-            if mask.sum() < 50:  # Need minimum samples
+            if mask.sum() < 50: 
                 continue
                 
             regime_probs = probabilities[mask]
             regime_targets = targets[mask] 
             regime_returns = returns[mask]
             
-            # Optimize threshold for this regime
+            
             best_threshold = self._optimize_single_regime(
                 regime_probs, regime_targets, regime_returns
             )
             
             regime_thresholds[regime] = best_threshold
             
-        # Set default threshold
         regime_thresholds['default'] = self.config.min_confidence
         
         logger.info(f"Optimized thresholds by regime: {regime_thresholds}")
@@ -1119,7 +1095,7 @@ class DynamicThresholdOptimizer:
                 win_loss_ratio = avg_win / avg_loss
                 kelly_score = win_rate - (1 - win_rate) / win_loss_ratio
                 
-                # Penalize if too few trades
+                
                 frequency_penalty = min(1.0, len(trade_returns) / 20)
                 score = kelly_score * frequency_penalty
                 
@@ -1135,7 +1111,7 @@ class DynamicThresholdOptimizer:
         return self.regime_thresholds.get(regime_code, self.config.min_confidence)
 
 # =========================
-# Advanced position sizing
+# Position sizing
 # =========================
 class KellyPositionSizer:
     """Kelly criterion-based position sizing with risk controls"""
@@ -1152,26 +1128,32 @@ class KellyPositionSizer:
                       max_position_value: float) -> float:
         """Calculate position size using modified Kelly criterion"""
         
-        # Estimate win rate and win/loss ratio from probability and expected return
         win_rate = probability
         
+        vol_adjustment = 1.0
+        if volatility < 0.015:      
+            vol_adjustment = 1.3    
+        elif volatility > 0.035:    
+            vol_adjustment = 0.7    
+
         # Conservative estimates
-        avg_win = max(0.02, expected_return * 1.5)  # Conservative estimate
-        avg_loss = max(0.015, volatility * 1.2)      # Risk estimate
+        avg_win = max(0.02, expected_return * 1.5)  
+        avg_loss = max(0.015, volatility * 1.2)     
         
         win_loss_ratio = avg_win / avg_loss
         
         # Kelly fraction
         kelly_f = win_rate - (1 - win_rate) / win_loss_ratio
-        
-        # Apply safety factors
-        kelly_f = max(0, min(kelly_f, 0.25))  # Cap at 25%
-        kelly_f *= self.config.kelly_fraction   # Additional safety factor
+        kelly_f *= vol_adjustment
+
+        # Safety factors
+        kelly_f = max(0, min(kelly_f, 0.25))  
+        kelly_f *= self.config.kelly_fraction   
         
         # Volatility adjustment
-        target_vol = self.config.target_annual_vol / np.sqrt(252)  # Daily
+        target_vol = self.config.target_annual_vol / np.sqrt(252)  
         vol_adjustment = target_vol / max(volatility, 0.01)
-        vol_adjustment = min(vol_adjustment, 2.0)  # Cap adjustment
+        vol_adjustment = min(vol_adjustment, 2.0)   
         
         # Final position value
         position_value = capital * kelly_f * vol_adjustment
@@ -1183,9 +1165,9 @@ class KellyPositionSizer:
         return max(0, shares)
 
 # =========================
-# Advanced risk management
+# Risk management
 # =========================
-class AdvancedRiskManager:
+class RiskManager:
     """Comprehensive risk management system"""
     
     def __init__(self, config: TradingConfig):
@@ -1204,22 +1186,22 @@ class AdvancedRiskManager:
         # Maximum position value based on capital
         max_position_value = capital * self.config.max_position_pct
         
-        # Expected return estimate (could be enhanced with more sophisticated models)
-        expected_return = (probability - 0.5) * 0.04  # Simple mapping
+        # Expected return estimate 
+        expected_return = (probability - 0.5) * 0.04  
         
         # Kelly-based sizing
         kelly_size = self.position_sizer.calculate_size(
             capital, price, probability, expected_return, volatility, max_position_value
         )
         
-        # Volatility-based sizing (alternative approach)
+        # Volatility-based sizing 
         vol_target = self.config.target_annual_vol / np.sqrt(252)
         vol_size = (vol_target * capital) / (volatility * price) if volatility > 0 else 0
         
-        # Use minimum of both approaches for safety
+        
         final_size = min(kelly_size, vol_size)
         
-        # Apply additional constraints
+       
         final_size = min(final_size, max_position_value / price)
         
         return max(0, math.floor(final_size))
@@ -1238,8 +1220,12 @@ class AdvancedRiskManager:
         if current_drawdown < -self.config.max_drawdown:
             return False
             
+        # Volatility filter
+        if regime_row.get('vol_regime', 0) == 1:  
+            return probability > 0.65  
+
         # Use regime detector
-        regime_detector = AdvancedRegimeDetector()
+        regime_detector = RegimeDetector()
         if not regime_detector.allow_trade(regime_row):
             return False
             
@@ -1276,8 +1262,19 @@ class AdvancedRiskManager:
         if highest_price >= tp_level:
             return True, "take_profit"
         
-        # Trailing stop (only if profitable)
-        if highest_price > entry_price * 1.01:  # At least 1% profit
+         # Profit protection after 50% gain
+        if highest_price > entry_price * 1.5:  
+            protective_stop = highest_price * 0.9  
+            if current_price <= protective_stop:
+                return True, "profit_protection"
+        
+        # Momentum-based exit
+        recent_return = (current_price - highest_price) / highest_price
+        if recent_return < -0.15 and days_held > 3:  
+            return True, "momentum_exit"
+    
+        # Trailing stop 
+        if highest_price > entry_price * 1.01:  
             trailing_level = self.calculate_trailing_stop(entry_price, highest_price, atr)
             if lowest_price <= trailing_level:
                 return True, "trailing_stop"
@@ -1289,20 +1286,20 @@ class AdvancedRiskManager:
         return False, "hold"
 
 # =========================
-# Enhanced cost model
+# Cost model
 # =========================
 class CostModel:
-    """Comprehensive transaction cost model for Indian markets"""
+    """Comprehensive transaction cost model"""
     
     def __init__(self, config: TradingConfig):
         self.config = config
-        # Indian market costs (in basis points)
-        self.brokerage_rate = 0.0005      # 0.05%
-        self.stt_rate = 0.001             # 0.10% on sell side
-        self.exchange_charges = 0.0000325 # ~0.00325%
-        self.sebi_charges = 10 / 1e7      # â‚¹10 per crore
-        self.gst_rate = 0.18              # 18% on brokerage + exchange charges
-        self.stamp_duty = 0.00015         # 0.015% on buy side
+        # Indian market costs 
+        self.brokerage_rate = 0.0002      
+        self.stt_rate = 0.001             
+        self.exchange_charges = 0.0000325 
+        self.sebi_charges = 10 / 1e7      
+        self.gst_rate = 0.18              
+        self.stamp_duty = 0.00015        
         
     def calculate_transaction_cost(self, side: str, notional_value: float) -> float:
         """Calculate total transaction cost"""
@@ -1319,10 +1316,10 @@ class CostModel:
         # GST on brokerage and exchange charges
         gst = (brokerage + exchange) * self.gst_rate
         
-        # STT (only on sell side for equity delivery)
+        # STT 
         stt = notional_value * self.stt_rate if side.lower() == 'sell' else 0
         
-        # Stamp duty (only on buy side)
+        # Stamp duty 
         stamp = notional_value * self.stamp_duty if side.lower() == 'buy' else 0
         
         total_cost = brokerage + exchange + sebi + gst + stt + stamp
@@ -1333,18 +1330,18 @@ class CostModel:
         """Estimate market impact cost"""
         
         if avg_volume <= 0:
-            return 0.01  # 1% default impact
+            return 0.01 
             
-        # Participation rate
+        
         participation = trade_size / avg_volume
         
-        # Square root model for market impact
+      
         impact = self.config.impact_coefficient * math.sqrt(participation) * volatility
         
-        return min(impact, 0.05)  # Cap at 5%
+        return min(impact, 0.05) 
 
 # =========================
-# Enhanced backtester
+# Backtester
 # =========================
 class Backtester:
     """Comprehensive backtesting engine with walk-forward analysis"""
@@ -1360,17 +1357,17 @@ class Backtester:
         self.regime_data = regime_data.sort_index()
         self.config = config
         self.cost_model = CostModel(config)
-        self.risk_manager = AdvancedRiskManager(config)
+        self.risk_manager = RiskManager(config)
         
     def run_backtest(self, 
-                    model: AdvancedMLPipeline,
+                    model: MLPipeline,
                     threshold_optimizer: DynamicThresholdOptimizer,
                     initial_capital: float = 100000) -> Dict[str, Any]:
         """Run comprehensive backtest"""
         
-        logger.info("Starting enhanced backtest...")
+        logger.info("Starting backtest...")
         
-        # Align all data
+      
         common_index = (self.price_data.index
                        .intersection(self.feature_data.index)
                        .intersection(self.regime_data.index))
@@ -1379,31 +1376,31 @@ class Backtester:
         features = self.feature_data.loc[common_index]
         regimes = self.regime_data.loc[common_index]
         
-        # Prepare features and targets
+       
         X = features.drop(['target_return', 'target_direction'], axis=1, errors='ignore')
         y = features['target_direction'].astype(int)
         returns = features['target_return']
         
-        # Train model with walk-forward validation
+      
         logger.info("Training model...")
         model_metrics = model.fit(X, y, n_splits=5)
         
-        # Get predictions
+       
         probabilities = pd.Series(model.predict_proba(X), index=X.index)
         
-        # Optimize thresholds
+      
         logger.info("Optimizing thresholds...")
         threshold_optimizer.regime_thresholds = threshold_optimizer.optimize_by_regime(
             probabilities, y, regimes, returns
         )
         
-        # Run simulation
+       
         results = self._simulate_trading(
             prices, features, regimes, probabilities, 
             threshold_optimizer, initial_capital
         )
         
-        # Add model metrics
+        
         results['model_metrics'] = model_metrics
         results['feature_importance'] = model.get_feature_importance()
         
@@ -1418,19 +1415,19 @@ class Backtester:
                          initial_capital: float) -> Dict[str, Any]:
         """Simulate trading strategy"""
         
-        # Initialize tracking variables
+        
         capital = initial_capital
         position_shares = 0.0
         position_entry_price = 0.0
         position_highest_price = 0.0
         position_days_held = 0
         
-        # Tracking lists
+       
         nav_history = []
         position_history = []
         trade_history = []
         
-        # Calculate average daily volume for sizing constraints
+        
         avg_volume = prices['volume'].rolling(20).mean().fillna(method='bfill')
         
         for i in range(1, len(prices) - 1):
@@ -1441,25 +1438,25 @@ class Backtester:
             current_regime = regimes.loc[current_date]
             current_prob = probabilities.loc[current_date]
             
-            # Get volatility and ATR
+            
             current_vol = features.loc[current_date, 'vol_20'] if 'vol_20' in features.columns else 0.02
             current_atr = features.loc[current_date, 'atr_14'] if 'atr_14' in features.columns else current_bar['high'] - current_bar['low']
             
-            # Update NAV
+            
             nav = capital + position_shares * current_bar['close']
             nav_history.append(nav)
             position_history.append(position_shares)
             
-            # Calculate current drawdown
+            
             peak_nav = max(nav_history) if nav_history else initial_capital
             current_drawdown = (nav - peak_nav) / peak_nav
             
-            # Manage existing position
+            
             if position_shares > 0:
                 position_days_held += 1
                 position_highest_price = max(position_highest_price, current_bar['high'])
                 
-                # Check exit conditions
+               
                 should_exit, exit_reason = self.risk_manager.should_exit_position(
                     position_entry_price,
                     current_bar['close'],
@@ -1470,25 +1467,23 @@ class Backtester:
                 )
                 
                 if should_exit:
-                    # Execute exit at next open
                     exit_price = next_bar['open']
                     
-                    # Calculate market impact
+                    
                     impact_cost = self.cost_model.calculate_market_impact(
                         position_shares * exit_price,
                         avg_volume.loc[current_date] * current_bar['close'],
                         current_vol
                     )
                     
-                    # Apply slippage and costs
+                    
                     actual_exit_price = exit_price * (1 - impact_cost)
                     notional = position_shares * actual_exit_price
                     transaction_cost = self.cost_model.calculate_transaction_cost('sell', notional)
                     
-                    # Update capital
+                    
                     capital += notional - transaction_cost
                     
-                    # Record trade
                     pnl = (actual_exit_price - position_entry_price) * position_shares - transaction_cost
                     trade_history.append({
                         'exit_date': next_bar.name,
@@ -1500,7 +1495,7 @@ class Backtester:
                         'return_pct': pnl / (position_entry_price * position_shares)
                     })
                     
-                    # Reset position
+                    
                     position_shares = 0.0
                     position_entry_price = 0.0
                     position_highest_price = 0.0
@@ -1508,43 +1503,42 @@ class Backtester:
                     
                     continue
             
-            # Check for new position entry
+            
             if position_shares == 0:
                 threshold = threshold_optimizer.get_threshold(current_regime)
                 
                 if (current_prob > threshold and 
                     self.risk_manager.should_enter_position(current_prob, current_regime, current_drawdown)):
                     
-                    # Calculate position size
+                    
                     entry_price = next_bar['open']
                     position_size = self.risk_manager.calculate_position_size(
                         capital, entry_price, current_prob, current_vol, current_atr
                     )
                     
                     if position_size > 0:
-                        # Calculate market impact
+                        
                         impact_cost = self.cost_model.calculate_market_impact(
                             position_size * entry_price,
                             avg_volume.loc[current_date] * current_bar['close'],
                             current_vol
                         )
                         
-                        # Apply slippage and costs
                         actual_entry_price = entry_price * (1 + impact_cost)
                         notional = position_size * actual_entry_price
                         transaction_cost = self.cost_model.calculate_transaction_cost('buy', notional)
                         
-                        # Check if we have enough capital
+                       
                         total_cost = notional + transaction_cost
                         if total_cost <= capital:
-                            # Execute trade
+                            
                             capital -= total_cost
                             position_shares = position_size
                             position_entry_price = actual_entry_price
                             position_highest_price = actual_entry_price
                             position_days_held = 0
                             
-                            # Record trade entry
+                            
                             trade_history.append({
                                 'entry_date': next_bar.name,
                                 'entry_price': actual_entry_price,
@@ -1554,12 +1548,12 @@ class Backtester:
                                 'transaction_cost': transaction_cost
                             })
         
-        # Convert to series
+     
         nav_series = pd.Series(nav_history, index=prices.index[1:-1])
         position_series = pd.Series(position_history, index=prices.index[1:-1])
         returns_series = nav_series.pct_change().fillna(0)
         
-        # Calculate performance metrics
+        # Performance metrics
         performance_stats = self._calculate_performance_stats(nav_series, returns_series, trade_history)
         
         return {
@@ -1630,9 +1624,9 @@ class Backtester:
         }
 
 # =========================
-# Enhanced Performance Visualization
+# Performance Visualization
 # =========================
-class EnhancedPerformanceVisualizer:
+class PerformanceVisualizer:
     """Comprehensive portfolio performance visualization with Plotly"""
     
     def __init__(self):
@@ -1674,7 +1668,7 @@ class EnhancedPerformanceVisualizer:
     
     def plot_portfolio_performance(self, nav_series: pd.Series, benchmark_data: pd.DataFrame,
                                  trade_history: List[Dict], symbol: str) -> go.Figure:
-        """Enhanced portfolio vs benchmark performance"""
+        """ Portfolio vs benchmark performance"""
         
         fig = make_subplots(
             rows=3, cols=1,
@@ -1841,7 +1835,7 @@ class EnhancedPerformanceVisualizer:
                             xref="paper", yref="paper", x=0.5, y=0.5)
             return fig
         
-        # FIXED: Use proper subplot specs for pie chart
+        
         fig = make_subplots(
             rows=2, cols=2,
             subplot_titles=[
@@ -1851,7 +1845,7 @@ class EnhancedPerformanceVisualizer:
                 "Exit Reason Breakdown"
             ],
             specs=[[{"type": "xy"}, {"type": "xy"}],
-                [{"type": "xy"}, {"type": "domain"}]]  # Fixed: domain type for pie chart
+                [{"type": "xy"}, {"type": "domain"}]]  
         )
         
         # P&L distribution
@@ -1896,7 +1890,7 @@ class EnhancedPerformanceVisualizer:
             row=2, col=1
         )
         
-        # Exit reasons (FIXED)
+        # Exit reasons 
         exit_reasons = [t.get('exit_reason', 'unknown') for t in completed_trades]
         exit_counts = pd.Series(exit_reasons).value_counts()
         
@@ -1921,10 +1915,10 @@ class EnhancedPerformanceVisualizer:
     def plot_monthly_returns_heatmap(self, returns_series: pd.Series) -> go.Figure:
         """Monthly returns heatmap"""
         
-        # Calculate monthly returns
+        # Monthly returns
         monthly_returns = returns_series.resample('M').apply(lambda x: (1 + x).prod() - 1)
         
-        # Create pivot table for heatmap
+        # Pivot table
         monthly_data = []
         for date, ret in monthly_returns.items():
             monthly_data.append({
@@ -1991,7 +1985,7 @@ class EnhancedPerformanceVisualizer:
             row=1, col=1
         )
         
-        # Add horizontal line at 1.0 for Sharpe
+        
         fig.add_hline(y=1.0, line_dash="dash", line_color="gray", row=1, col=1)
         
         # Rolling Sortino
@@ -2015,7 +2009,7 @@ class EnhancedPerformanceVisualizer:
         return fig
 
 # =========================
-# Enhanced data manager
+# Data manager
 # =========================
 class DataManager:
     """Data management with multiple data sources"""
@@ -2054,7 +2048,7 @@ class DataManager:
     
     def download_data(self, 
                      symbol: str, 
-                     period: str = "3y", 
+                     period: str = "10y", 
                      interval: str = "1d") -> pd.DataFrame:
         """Download price data with error handling"""
         
@@ -2144,18 +2138,18 @@ class DataManager:
             return None
 
 # =========================
-# Main enhanced trading bot
+# AI Trading bot
 # =========================
 class AITradingBot:
-    """Institution-level AI trading bot with advanced features"""
+    """Institution-level AI trading bot with end-to-end workflow"""
     
     def __init__(self, config: Optional[TradingConfig] = None):
         self.config = config or TradingConfig()
         self.data_manager = DataManager()
         self.feature_builder = FeatureBuilder()
-        self.model = AdvancedMLPipeline(self.config)
+        self.model = MLPipeline(self.config)
         self.threshold_optimizer = DynamicThresholdOptimizer(self.config)
-        self.visualizer = EnhancedPerformanceVisualizer()
+        self.visualizer = PerformanceVisualizer()
         
     def run_analysis(self, 
             symbol: str = 'TATAMOTORS',
@@ -2225,13 +2219,13 @@ class AITradingBot:
 
 
     def _print_analysis_report(self, symbol: str, results: Dict[str, Any]):
-        """Enhanced analysis report with signal quality focus"""
+        """Analysis report with signal quality focus"""
         
         stats = results['performance_stats']
         model_metrics = results.get('model_metrics', {})
         
         print("\n" + "=" * 90)
-        print(f" ENHANCED AI TRADING BOT ANALYSIS - {symbol}")
+        print(f" AI TRADING BOT ANALYSIS - {symbol}")
         print("=" * 90)
         
         auc = model_metrics.get('auc', 0)
@@ -2474,36 +2468,33 @@ class AITradingBot:
 # Main execution
 # =========================
 def main():
-    """Enhanced main execution"""
+    """Main execution"""
     
     config = TradingConfig(
         target_annual_vol=0.18,
         max_drawdown=0.12,
-        min_confidence=0.48,
-        kelly_fraction=0.25,
-        stop_atr_multiplier=2.0,
-        tp_atr_multiplier=4.0,
-        max_hold_days=15
+        min_confidence=0.58,
+        kelly_fraction=0.6,
+        stop_atr_multiplier=3.0,
+        tp_atr_multiplier=6.0,
+        max_hold_days=35
     )
     
     bot = AITradingBot(config)
     
    
-    symbol = 'HINDUNILVR'
+    symbol = 'RELIANCE'
     
     try:
-        logger.info(f"Running enhanced analysis for {symbol}...")
+        logger.info(f"Running analysis for {symbol}...")
         results = bot.run_analysis(
             symbol=symbol,
-            period='2y',
+            period='5y',
             initial_capital=500000,
-            show_plots=True  # Enable comprehensive plotting
+            show_plots=True  
         )
         
-        # Optional: Save results and plots
-        # import pickle
-        # with open(f'{symbol}_enhanced_results.pkl', 'wb') as f:
-         #   pickle.dump(results, f)
+       
             
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
